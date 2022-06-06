@@ -74,12 +74,12 @@ func (ot OperationType) String() string {
 }
 
 // SendConsensus passes the given ConsensusRequest message to the raft.Node instance.
-func (s *RPC) SendConsensus(destination uint64, msg *orderer.ConsensusRequest) error {
+func (s *RPC) SendConsensus(source uint64, destination uint64, msg *orderer.ConsensusRequest) error {
 	if s.Logger.IsEnabledFor(zapcore.DebugLevel) {
 		defer s.consensusSent(time.Now(), destination, msg)
 	}
 
-	stream, err := s.getOrCreateStream(destination, ConsensusOperation)
+	stream, err := s.getOrCreateStream(source, destination, ConsensusOperation)
 	if err != nil {
 		return err
 	}
@@ -102,12 +102,12 @@ func (s *RPC) SendConsensus(destination uint64, msg *orderer.ConsensusRequest) e
 }
 
 // SendSubmit sends a SubmitRequest to the given destination node.
-func (s *RPC) SendSubmit(destination uint64, request *orderer.SubmitRequest, report func(error)) error {
+func (s *RPC) SendSubmit(source uint64, destination uint64, request *orderer.SubmitRequest, report func(error)) error {
 	if s.Logger.IsEnabledFor(zapcore.DebugLevel) {
 		defer s.submitSent(time.Now(), destination, request)
 	}
 
-	stream, err := s.getOrCreateStream(destination, SubmitOperation)
+	stream, err := s.getOrCreateStream(source, destination, SubmitOperation)
 	if err != nil {
 		return err
 	}
@@ -145,12 +145,12 @@ func (s *RPC) consensusSent(start time.Time, to uint64, msg *orderer.ConsensusRe
 }
 
 // getOrCreateStream obtains a Submit stream for the given destination node
-func (s *RPC) getOrCreateStream(destination uint64, operationType OperationType) (*Stream, error) {
+func (s *RPC) getOrCreateStream(source uint64, destination uint64, operationType OperationType) (*Stream, error) {
 	stream := s.getStream(destination, operationType)
 	if stream != nil {
 		return stream, nil
 	}
-	stub, err := s.Comm.Remote(s.Channel, destination)
+	stub, err := s.Comm.Remote(s.Channel, source, destination)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

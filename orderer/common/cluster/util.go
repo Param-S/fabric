@@ -8,6 +8,7 @@ package cluster
 
 import (
 	"bytes"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/hyperledger/fabric-config/protolator"
 	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
@@ -30,6 +32,8 @@ import (
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 )
 
 // ConnByCertMap maps certificates represented as strings
@@ -792,4 +796,34 @@ func (cm *ComparisonMemoizer) setup() {
 	defer cm.lock.Unlock()
 	cm.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	cm.cache = make(map[arguments]bool)
+}
+
+func exportKM(cs tls.ConnectionState, label string, context []byte) ([]byte, error) {
+	tlsBinding, err := cs.ExportKeyingMaterial(label, context, 32)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed generating TLS Binding material")
+	}
+	return tlsBinding, nil
+}
+
+func GetTLSSessionBinding(stream grpc.Stream, signPayload *orderer.AuthRequest) ([]byte, error) {
+	peerInfo, ok := peer.FromContext(stream.Context())
+	connState := peerInfo.AuthInfo.(credentials.TLSInfo).State
+	if !ok {
+		return nil, errors.New("failed extracting stream context")
+	}
+
+	encodeSignFields, err := protoutil.Marshal(signPayload)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed encoding signature attributes")
+	}
+
+	tlsBindingContext := util.ComputeSHA256(encodeSignFields)
+
+	tlsBinding, err := exportKM(connState, "EXPERIMENTAL label for orderer", tlsBindingContext)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed exporting keying material")
+	}
+
+	return tlsBinding, nil
 }

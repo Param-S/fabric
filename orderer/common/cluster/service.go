@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"github.com/hyperledger/fabric/common/util"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 //go:generate mockery -dir . -name Dispatcher -case underscore -output ./mocks/
@@ -63,6 +66,7 @@ func (s *Service) Step(stream orderer.Cluster_StepServer) error {
 			return nil
 		}
 		if err != nil {
+			s.Logger.Debugf("%s(%s) error processing message error %v", commonName, addr, err)
 			return err
 		}
 		// Else, no error occurred, so we continue to the next iteration
@@ -84,6 +88,32 @@ func (s *Service) handleMessage(stream StepStream, addr string, exp *certificate
 	if s.StepLogger.IsEnabledFor(zap.DebugLevel) {
 		nodeName := commonNameFromContext(stream.Context())
 		s.StepLogger.Debugf("Received message from %s(%s): %v", nodeName, addr, requestAsString(request))
+	}
+
+	if authReq := request.GetAuthRequest(); authReq != nil {
+		signFields := &orderer.AuthRequest{
+			Version:   authReq.Version,
+			Timestamp: authReq.Timestamp,
+			FromId:    authReq.FromId,
+			ToId:      authReq.ToId,
+			Channel:   authReq.Channel,
+		}
+
+		tlsBinding, err := GetTLSSessionBinding(stream, signFields)
+		if err != nil {
+			s.Logger.Warnf("Session binding extraction failed with error: %v", err)
+			status.Errorf(codes.Unauthenticated, "Session binding error %v", err)
+			return err
+		}
+
+		if bytes.Equal(tlsBinding, authReq.SessionBinding) {
+			s.Logger.Warnf("Session binding validation failed")
+			return status.Error(codes.Unauthenticated, "Session binding validation failed")
+		}
+
+		// TODO: signature validation
+
+		return nil
 	}
 
 	if submitReq := request.GetSubmitRequest(); submitReq != nil {
