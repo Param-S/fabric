@@ -73,8 +73,8 @@ type Configurator interface {
 
 // RPC is used to mock the transport layer in tests.
 type RPC interface {
-	SendConsensus(dest uint64, msg *orderer.ConsensusRequest) error
-	SendSubmit(dest uint64, request *orderer.SubmitRequest, report func(err error)) error
+	SendConsensus(source uint64, dest uint64, msg *orderer.ConsensusRequest) error
+	SendSubmit(source uint64, dest uint64, request *orderer.SubmitRequest, report func(err error)) error
 }
 
 //go:generate counterfeiter -o mocks/mock_blockpuller.go . BlockPuller
@@ -542,7 +542,7 @@ func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
 		}
 
 		if lead != c.raftID {
-			if err := c.forwardToLeader(lead, req); err != nil {
+			if err := c.forwardToLeader(sender, lead, req); err != nil {
 				return err
 			}
 		}
@@ -555,7 +555,7 @@ func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
 	return nil
 }
 
-func (c *Chain) forwardToLeader(lead uint64, req *orderer.SubmitRequest) error {
+func (c *Chain) forwardToLeader(sender uint64, lead uint64, req *orderer.SubmitRequest) error {
 	c.logger.Infof("Forwarding transaction to the leader %d", lead)
 	timer := time.NewTimer(c.opts.RPCTimeout)
 	defer timer.Stop()
@@ -571,7 +571,7 @@ func (c *Chain) forwardToLeader(lead uint64, req *orderer.SubmitRequest) error {
 		close(sentChan)
 	}
 
-	c.rpc.SendSubmit(lead, req, report)
+	c.rpc.SendSubmit(sender, lead, req, report)
 
 	select {
 	case <-sentChan:

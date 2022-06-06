@@ -8,6 +8,7 @@ package cluster
 
 import (
 	"bytes"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -792,4 +793,12 @@ func (cm *ComparisonMemoizer) setup() {
 	defer cm.lock.Unlock()
 	cm.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	cm.cache = make(map[arguments]bool)
+}
+
+func exportKM(cs tls.ConnectionState, label string, context []byte) ([]byte, error) {
+	tlsBinding, err := cs.ExportKeyingMaterial(label, context, 32)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed generating TLS Binding material")
+	}
+	return tlsBinding, nil
 }

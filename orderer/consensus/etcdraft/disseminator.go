@@ -21,7 +21,7 @@ type Disseminator struct {
 	metadata []byte
 }
 
-func (d *Disseminator) SendConsensus(dest uint64, msg *orderer.ConsensusRequest) error {
+func (d *Disseminator) SendConsensus(source uint64, dest uint64, msg *orderer.ConsensusRequest) error {
 	d.l.Lock()
 	defer d.l.Unlock()
 
@@ -30,7 +30,7 @@ func (d *Disseminator) SendConsensus(dest uint64, msg *orderer.ConsensusRequest)
 		d.sent[dest] = true
 	}
 
-	return d.RPC.SendConsensus(dest, msg)
+	return d.RPC.SendConsensus(source, dest, msg)
 }
 
 func (d *Disseminator) UpdateMetadata(m []byte) {

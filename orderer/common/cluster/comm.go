@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
 	"sync"
@@ -17,13 +18,19 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/timestamp"
+	common "github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/util"
+	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 )
 
 const (
@@ -50,6 +57,7 @@ type ChannelExtractor interface {
 type Handler interface {
 	OnConsensus(channel string, sender uint64, req *orderer.ConsensusRequest) error
 	OnSubmit(channel string, sender uint64, req *orderer.SubmitRequest) error
+	OnAuth(channel string, sender uint64, req *orderer.AuthRequest) error
 }
 
 // RemoteNode represents a cluster member
@@ -77,7 +85,7 @@ type Communicator interface {
 	// Remote returns a RemoteContext for the given RemoteNode ID in the context
 	// of the given channel, or error if connection cannot be established, or
 	// the channel wasn't configured
-	Remote(channel string, id uint64) (*RemoteContext, error)
+	Remote(channel string, source uint64, destination uint64) (*RemoteContext, error)
 	// Configure configures the communication to connect to all
 	// given members, and disconnect from any members not among the given
 	// members.
@@ -110,6 +118,14 @@ type Comm struct {
 type requestContext struct {
 	channel string
 	sender  uint64
+}
+
+type AuthSignatureFields struct {
+	version   uint32
+	timestamp timestamp.Timestamp
+	fromId    uint64
+	toId      uint64
+	channel   string
 }
 
 // DispatchSubmit identifies the channel and sender of the submit request and passes it
@@ -165,7 +181,7 @@ func (c *Comm) requestContext(ctx context.Context, msg proto.Message) (*requestC
 
 // Remote obtains a RemoteContext linked to the destination node on the context
 // of a given channel
-func (c *Comm) Remote(channel string, id uint64) (*RemoteContext, error) {
+func (c *Comm) Remote(channel string, source uint64, destination uint64) (*RemoteContext, error) {
 	c.Lock.RLock()
 	defer c.Lock.RUnlock()
 
@@ -177,16 +193,16 @@ func (c *Comm) Remote(channel string, id uint64) (*RemoteContext, error) {
 	if !exists {
 		return nil, errors.Errorf("channel %s doesn't exist", channel)
 	}
-	stub := mapping.ByID(id)
+	stub := mapping.ByID(destination)
 	if stub == nil {
-		return nil, errors.Errorf("node %d doesn't exist in channel %s's membership", id, channel)
+		return nil, errors.Errorf("node %d doesn't exist in channel %s's membership", destination, channel)
 	}
 
 	if stub.Active() {
 		return stub.RemoteContext, nil
 	}
 
-	err := stub.Activate(c.createRemoteContext(stub, channel))
+	err := stub.Activate(c.createRemoteContext(stub, channel, source))
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -313,13 +329,13 @@ func (c *Comm) updateStubInMapping(channel string, mapping MemberMapping, node R
 	}
 
 	// Activate the stub
-	stub.Activate(c.createRemoteContext(stub, channel))
+	stub.Activate(c.createRemoteContext(stub, channel, 0))
 }
 
 // createRemoteStub returns a function that creates a RemoteContext.
 // It is used as a parameter to Stub.Activate() in order to activate
 // a stub atomically.
-func (c *Comm) createRemoteContext(stub *Stub, channel string) func() (*RemoteContext, error) {
+func (c *Comm) createRemoteContext(stub *Stub, channel string, sourceNode uint64) func() (*RemoteContext, error) {
 	return func() (*RemoteContext, error) {
 		cert, err := x509.ParseCertificate(stub.ServerTLSCert)
 		if err != nil {
@@ -364,6 +380,8 @@ func (c *Comm) createRemoteContext(stub *Stub, channel string) func() (*RemoteCo
 			ProbeConn:                        probeConnection,
 			conn:                             conn,
 			Client:                           clusterClient,
+			sourceNodeID:                     sourceNode,
+			destNodeID:                       stub.ID,
 		}
 		return rc, nil
 	}
@@ -457,6 +475,8 @@ type RemoteContext struct {
 	nextStreamID                     uint64
 	streamsByID                      streamsMapperReporter
 	workerCountReporter              workerCountReporter
+	sourceNodeID                     uint64
+	destNodeID                       uint64
 }
 
 // Stream is used to send/receive messages to/from the remote cluster member.
@@ -539,7 +559,7 @@ func (stream *Stream) sendOrDrop(request *orderer.StepRequest, allowDrop bool, r
 }
 
 // sendMessage sends the request down the stream
-func (stream *Stream) sendMessage(request *orderer.StepRequest, report func(error)) {
+func (stream *Stream) sendMessage(request *orderer.StepRequest, report func(error)) (*orderer.StepResponse, error) {
 	start := time.Now()
 	var err error
 	defer func() {
@@ -560,7 +580,7 @@ func (stream *Stream) sendMessage(request *orderer.StepRequest, report func(erro
 		return nil, err
 	}
 
-	_, err = stream.operateWithTimeout(f, report)
+	return stream.operateWithTimeout(f, report)
 }
 
 func (stream *Stream) serviceStream() {
@@ -656,6 +676,85 @@ func requestAsString(request *orderer.StepRequest) string {
 	}
 }
 
+func (stream *Stream) AuthenticateStream(version uint32, label string, fromId uint64, toId uint64, signer identity.SignerSerializer) error {
+	peerInfo, ok := peer.FromContext(stream.Cluster_StepClient.Context())
+	connState := peerInfo.AuthInfo.(credentials.TLSInfo).State
+	if !ok {
+		return errors.New("failed extracting stream context")
+	}
+
+	timestamp, err := ptypes.TimestampProto(time.Now().UTC())
+	if err != nil {
+		return errors.Wrap(err, "error validating Timestamp")
+	}
+
+	signFields := AuthSignatureFields{
+		version:   version,
+		timestamp: *timestamp,
+		fromId:    fromId,
+		toId:      toId,
+		channel:   stream.Channel,
+	}
+
+	asnSignFields, err := asn1.Marshal(signFields)
+	if err != nil {
+		return errors.Wrap(err, "failed encoding signature fields")
+	}
+
+	if signer == nil {
+		return errors.New("input signer is nil")
+	}
+
+	sig, err := signer.Sign(asnSignFields)
+	if err != nil {
+		return errors.Wrap(err, "signing failed")
+	}
+
+	tlsBindingContext := util.ComputeSHA256(asnSignFields)
+
+	tlsBinding, err := exportKM(connState, label, tlsBindingContext)
+	if err != nil {
+		return errors.Wrap(err, "stream authentication failed")
+	}
+
+	payload := &orderer.AuthRequest{
+		Version:        version,
+		Signature:      sig,
+		Timestamp:      timestamp,
+		FromId:         fromId,
+		ToId:           toId,
+		SessionBinding: tlsBinding,
+		Channel:        stream.Channel,
+	}
+
+	req := &orderer.StepRequest{
+		Payload: &orderer.StepRequest_Auth{
+			Auth: payload,
+		},
+	}
+
+	_, err = stream.sendMessage(req, func(_ error) {})
+	if err != nil {
+		return errors.Wrap(err, "authentiation failed to send the request")
+	}
+
+	stepRes, err := stream.Recv()
+	if err != nil {
+		return errors.Wrap(err, "authentication failed to receive the response")
+	}
+
+	subRes := stepRes.GetSubmitRes()
+	if subRes == nil {
+		return errors.Wrap(err, "malformed authentication response")
+	}
+
+	if subRes.Status != common.Status_SUCCESS {
+		return errors.Wrapf(err, "authentication failed with code %d", subRes.Status)
+	}
+
+	return nil
+}
+
 // NewStream creates a new stream.
 // It is not thread safe, and Send() or Recv() block only until the timeout expires.
 func (rc *RemoteContext) NewStream(timeout time.Duration) (*Stream, error) {
@@ -724,6 +823,11 @@ func (rc *RemoteContext) NewStream(timeout time.Duration) (*Stream, error) {
 		alert: func(template string, args ...interface{}) {
 			s.Logger.Warningf(template, args...)
 		},
+	}
+
+	err = s.AuthenticateStream(0, "", rc.sourceNodeID, rc.destNodeID, nil) // TODO: version, label & signer needs to be decided
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to open new stream")
 	}
 
 	rc.Logger.Debugf("Created new stream to %s with ID of %d and buffer size of %d",
