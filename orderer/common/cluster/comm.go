@@ -10,16 +10,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
 	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/util"
+	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -30,6 +34,14 @@ const (
 	// MinimumExpirationWarningInterval is the default minimum time interval
 	// between consecutive warnings about certificate expiration.
 	MinimumExpirationWarningInterval = time.Minute * 5
+)
+
+type ClientVersion int
+
+const (
+	// Cluster Service versions.
+	ClusterServiceClient ClientVersion = iota + 2
+	ClusterServiceClientWithAuth
 )
 
 var (
@@ -105,6 +117,7 @@ type Comm struct {
 	Chan2Members                     MembersByChannel
 	Metrics                          *Metrics
 	CompareCertificate               CertificateComparator
+	ServiceClientVersion             ClientVersion
 }
 
 type requestContext struct {
@@ -344,7 +357,14 @@ func (c *Comm) createRemoteContext(stub *Stub, channel string) func() (*RemoteCo
 			return nil
 		}
 
-		clusterClient := orderer.NewClusterClient(conn)
+		var clusterClient interface{}
+		if c.ServiceClientVersion == 0 || c.ServiceClientVersion == ClusterServiceClient {
+			clusterClient = orderer.NewClusterClient(conn)
+		} else if c.ServiceClientVersion == ClusterServiceClientWithAuth {
+			clusterClient = orderer.NewClusterNodeServiceClient(conn)
+		} else {
+			return nil, errors.New("communicator initialized with incorrect client version")
+		}
 
 		workerCountReporter := workerCountReporter{
 			channel: channel,
@@ -451,12 +471,14 @@ type RemoteContext struct {
 	shutdownSignal                   chan struct{}
 	Logger                           *flogging.FabricLogger
 	endpoint                         string
-	Client                           orderer.ClusterClient
+	Client                           interface{}
 	ProbeConn                        func(conn *grpc.ClientConn) error
 	conn                             *grpc.ClientConn
 	nextStreamID                     uint64
 	streamsByID                      streamsMapperReporter
 	workerCountReporter              workerCountReporter
+	SourceNodeID                     uint64
+	DestinationNodeID                uint64
 }
 
 // Stream is used to send/receive messages to/from the remote cluster member.
@@ -466,19 +488,19 @@ type Stream struct {
 		request *orderer.StepRequest
 		report  func(error)
 	}
-	commShutdown chan struct{}
-	abortReason  *atomic.Value
-	metrics      *Metrics
-	ID           uint64
-	Channel      string
-	NodeName     string
-	Endpoint     string
-	Logger       *flogging.FabricLogger
-	Timeout      time.Duration
-	orderer.Cluster_StepClient
-	Cancel   func(error)
-	canceled *uint32
-	expCheck *certificateExpirationCheck
+	commShutdown       chan struct{}
+	abortReason        *atomic.Value
+	metrics            *Metrics
+	ID                 uint64
+	Channel            string
+	NodeName           string
+	Endpoint           string
+	Logger             *flogging.FabricLogger
+	Timeout            time.Duration
+	Cluster_StepClient grpc.ClientStream
+	Cancel             func(error)
+	canceled           *uint32
+	expCheck           *certificateExpirationCheck
 }
 
 // StreamOperation denotes an operation done by a stream, such a Send or Receive.
@@ -555,7 +577,18 @@ func (stream *Stream) sendMessage(request *orderer.StepRequest, report func(erro
 	f := func() (*orderer.StepResponse, error) {
 		startSend := time.Now()
 		stream.expCheck.checkExpiration(startSend, stream.Channel)
-		err := stream.Cluster_StepClient.Send(request)
+		switch cli := stream.Cluster_StepClient.(type) {
+		case orderer.Cluster_StepClient:
+			err = cli.Send(request)
+		case orderer.ClusterNodeService_StepClient:
+			stepRequest, cerr := BuildStepRequest(request)
+			if cerr != nil {
+				return nil, err
+			}
+			err = cli.Send(stepRequest)
+		default:
+			return nil, errors.New("service stream type not valid")
+		}
 		stream.metrics.reportMsgSendTime(stream.Endpoint, stream.Channel, time.Since(startSend))
 		return nil, err
 	}
@@ -594,7 +627,18 @@ func (stream *Stream) Recv() (*orderer.StepResponse, error) {
 	}()
 
 	f := func() (*orderer.StepResponse, error) {
-		return stream.Cluster_StepClient.Recv()
+		switch cli := stream.Cluster_StepClient.(type) {
+		case orderer.Cluster_StepClient:
+			return cli.Recv()
+		case orderer.ClusterNodeService_StepClient:
+			nodeResponse, err := cli.Recv()
+			if err != nil {
+				return nil, err
+			}
+			return BuildStepRespone(nodeResponse)
+		default:
+			return nil, errors.New("service stream type not valid")
+		}
 	}
 
 	return stream.operateWithTimeout(f, func(_ error) {})
@@ -640,6 +684,70 @@ func (stream *Stream) operateWithTimeout(invoke StreamOperation, report func(err
 	}
 }
 
+func (stream *Stream) AuthenticateStream(version uint32, fromId uint64, toId uint64, signer identity.SignerSerializer) error {
+	if signer == nil {
+		return errors.New("signer is nil")
+	}
+
+	timestamp, err := ptypes.TimestampProto(time.Now().UTC())
+	if err != nil {
+		return errors.Wrap(err, "failed to read timestamp")
+	}
+
+	payload := &orderer.NodeAuthRequest{
+		Version:   version,
+		Timestamp: timestamp,
+		FromId:    fromId,
+		ToId:      toId,
+		Channel:   stream.Channel,
+	}
+
+	bindingFieldsHash := GetSessionBindingHash(payload)
+
+	tlsBinding, err := GetTLSSessionBinding(stream.Cluster_StepClient, bindingFieldsHash)
+	if err != nil {
+		return errors.Wrap(err, "TLSBinding failed")
+	}
+	payload.SessionBinding = tlsBinding
+
+	asnSignFields, _ := asn1.Marshal(AuthRequestSignature{
+		Version:   int64(payload.Version),
+		Timestamp: payload.Timestamp.String(),
+		FromId:    strconv.FormatUint(payload.FromId, 10),
+		ToId:      strconv.FormatUint(payload.ToId, 10),
+		Channel:   payload.Channel,
+	})
+	sig, err := signer.Sign(asnSignFields)
+	if err != nil {
+		return errors.Wrap(err, "signing failed")
+	}
+
+	payload.Signature = sig
+	stepRequest := &orderer.ClusterNodeServiceStepRequest{
+		Payload: &orderer.ClusterNodeServiceStepRequest_NodeAuthrequest{
+			NodeAuthrequest: payload,
+		},
+	}
+
+	f := func() (*orderer.StepResponse, error) {
+		cli := stream.Cluster_StepClient.(orderer.ClusterNodeService_StepClient)
+		err := cli.Send(stepRequest)
+		return nil, err
+	}
+
+	_, err = stream.operateWithTimeout(f, func(_ error) {})
+	if err != nil {
+		return errors.Wrapf(err, "stream authentication request failed")
+	} else {
+		_, err = stream.Recv()
+		if err != nil {
+			return errors.Wrapf(err, "stream authentication failed")
+		}
+	}
+
+	return nil
+}
+
 func requestAsString(request *orderer.StepRequest) string {
 	switch t := request.GetPayload().(type) {
 	case *orderer.StepRequest_SubmitRequest:
@@ -658,13 +766,24 @@ func requestAsString(request *orderer.StepRequest) string {
 
 // NewStream creates a new stream.
 // It is not thread safe, and Send() or Recv() block only until the timeout expires.
-func (rc *RemoteContext) NewStream(timeout time.Duration) (*Stream, error) {
+func (rc *RemoteContext) NewStream(timeout time.Duration, Signer identity.SignerSerializer) (*Stream, error) {
 	if err := rc.ProbeConn(rc.conn); err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.TODO())
-	stream, err := rc.Client.Step(ctx)
+
+	var stream grpc.ClientStream
+	var err error
+	switch cli := rc.Client.(type) {
+	case orderer.ClusterClient:
+		stream, err = cli.Step(ctx)
+	case orderer.ClusterNodeServiceClient:
+		stream, err = cli.Step(ctx)
+	default:
+		cancel()
+		return nil, errors.New("cluster client type not valid")
+	}
 	if err != nil {
 		cancel()
 		return nil, errors.WithStack(err)
@@ -724,6 +843,16 @@ func (rc *RemoteContext) NewStream(timeout time.Duration) (*Stream, error) {
 		alert: func(template string, args ...interface{}) {
 			s.Logger.Warningf(template, args...)
 		},
+	}
+
+	if _, ok := rc.Client.(orderer.ClusterNodeServiceClient); ok {
+		s.Logger.Debugf("Client configured to use authenticated stream")
+		err := s.AuthenticateStream(0, rc.SourceNodeID, rc.DestinationNodeID, Signer)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create new stream")
+		}
+	} else {
+		s.Logger.Debugf("New stream is created")
 	}
 
 	rc.Logger.Debugf("Created new stream to %s with ID of %d and buffer size of %d",
@@ -791,4 +920,51 @@ func (wcr *workerCountReporter) decrement(m *Metrics) {
 	// which is just wcr.workerCount - 1.
 	count := atomic.AddUint32(&wcr.workerCount, ^uint32(0))
 	m.reportWorkerCount(wcr.channel, count)
+}
+
+func BuildStepRequest(request *orderer.StepRequest) (*orderer.ClusterNodeServiceStepRequest, error) {
+	if request == nil {
+		return nil, errors.New("request is nil")
+	}
+	var stepRequest *orderer.ClusterNodeServiceStepRequest
+	if consReq := request.GetConsensusRequest(); consReq != nil {
+		stepRequest = &orderer.ClusterNodeServiceStepRequest{
+			Payload: &orderer.ClusterNodeServiceStepRequest_NodeConrequest{
+				NodeConrequest: &orderer.NodeConsensusRequest{
+					Payload:  consReq.Payload,
+					Metadata: consReq.Metadata,
+				},
+			},
+		}
+		return stepRequest, nil
+	} else if subReq := request.GetSubmitRequest(); subReq != nil {
+		stepRequest = &orderer.ClusterNodeServiceStepRequest{
+			Payload: &orderer.ClusterNodeServiceStepRequest_NodeTranrequest{
+				NodeTranrequest: &orderer.NodeTransactionOrderRequest{
+					Payload:           subReq.Payload,
+					LastValidationSeq: subReq.LastValidationSeq,
+				},
+			},
+		}
+		return stepRequest, nil
+	}
+	return nil, errors.New("service message type not valid")
+}
+
+func BuildStepRespone(stepResponse *orderer.ClusterNodeServiceStepResponse) (*orderer.StepResponse, error) {
+	if stepResponse == nil {
+		return nil, errors.New("input response object is nil")
+	}
+	if respPayload := stepResponse.GetTranorderRes(); respPayload != nil {
+		stepResponse := &orderer.StepResponse{
+			Payload: &orderer.StepResponse_SubmitRes{
+				SubmitRes: &orderer.SubmitResponse{
+					Channel: respPayload.Channel,
+					Status:  respPayload.Status,
+				},
+			},
+		}
+		return stepResponse, nil
+	}
+	return nil, errors.New("service stream returned with invalid response type")
 }

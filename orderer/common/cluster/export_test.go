@@ -7,4 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package cluster
 
 // export for testing
-var BlockSignatureVerifier = blockSignatureVerifier
+var (
+	BlockSignatureVerifier = blockSignatureVerifier
+	ClusterRequestAsString = clusterRequestAsString
+)

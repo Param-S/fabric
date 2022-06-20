@@ -8,12 +8,15 @@ package cluster
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +25,7 @@ import (
 	"github.com/hyperledger/fabric-config/protolator"
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/msp"
+	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
@@ -32,7 +36,12 @@ import (
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 )
+
+//
+const KeyingMaterialLabel = "EXPERIMENTAL label for orderer"
 
 // ConnByCertMap maps certificates represented as strings
 // to gRPC connections
@@ -912,4 +921,61 @@ func (cm *ComparisonMemoizer) setup() {
 	defer cm.lock.Unlock()
 	cm.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	cm.cache = make(map[arguments]bool)
+}
+
+func exportKM(cs tls.ConnectionState, label string, context []byte) ([]byte, error) {
+	tlsBinding, err := cs.ExportKeyingMaterial(label, context, 32)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed generating TLS Binding material")
+	}
+	return tlsBinding, nil
+}
+
+func GetSessionBindingHash(authReq *orderer.NodeAuthRequest) []byte {
+	return util.ComputeSHA256(util.ConcatenateBytes(
+		[]byte(strconv.FormatUint(uint64(authReq.Version), 10)),
+		[]byte(authReq.Timestamp.String()),
+		[]byte(strconv.FormatUint(authReq.FromId, 10)),
+		[]byte(strconv.FormatUint(authReq.ToId, 10)),
+		[]byte(authReq.Channel),
+	))
+}
+
+func GetTLSSessionBinding(stream grpc.Stream, bindingPayload []byte) ([]byte, error) {
+	peerInfo, ok := peer.FromContext(stream.Context())
+	if !ok {
+		return nil, errors.New("failed extracting stream context")
+	}
+	connState := peerInfo.AuthInfo.(credentials.TLSInfo).State
+
+	tlsBinding, err := exportKM(connState, KeyingMaterialLabel, bindingPayload)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed exporting keying material")
+	}
+
+	return tlsBinding, nil
+}
+
+func VerifySignature(identity, msgHash, signature []byte) error {
+	block, _ := pem.Decode(identity)
+	if block == nil {
+		return errors.New("pem decoding failed")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return errors.Wrap(err, "key extraction failed")
+	}
+
+	pubKey, isECDSA := cert.PublicKey.(*ecdsa.PublicKey)
+	if !isECDSA {
+		return errors.New("not valid public key")
+	}
+
+	validSignature := ecdsa.VerifyASN1(pubKey, msgHash, signature)
+
+	if !validSignature {
+		return errors.New("signature invalid")
+	}
+	return nil
 }

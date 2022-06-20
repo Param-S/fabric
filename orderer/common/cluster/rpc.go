@@ -14,6 +14,7 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
+	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/pkg/errors"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
@@ -45,6 +46,8 @@ type RPC struct {
 	Comm          Communicator
 	lock          sync.RWMutex
 	StreamsByType map[OperationType]map[uint64]*Stream
+	SourceNodeID  uint64
+	Signer        identity.SignerSerializer
 }
 
 // NewStreamsByType returns a mapping of operation type to
@@ -154,7 +157,9 @@ func (s *RPC) getOrCreateStream(destination uint64, operationType OperationType)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	stream, err = stub.NewStream(s.Timeout)
+	stub.SourceNodeID = s.SourceNodeID
+	stub.DestinationNodeID = destination
+	stream, err = stub.NewStream(s.Timeout, s.Signer)
 	if err != nil {
 		return nil, err
 	}

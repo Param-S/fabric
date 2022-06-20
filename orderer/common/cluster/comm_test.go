@@ -449,7 +449,7 @@ func TestBlockingSend(t *testing.T) {
 				<-unBlock
 			}).Return(errors.New("oops"))
 
-			stream, err := rm.NewStream(time.Hour)
+			stream, err := rm.NewStream(time.Hour, nil)
 			require.NoError(t, err)
 
 			// The first send doesn't block, even though the Send operation blocks.
@@ -527,7 +527,7 @@ func TestEmptyRequest(t *testing.T) {
 	rm, err := node1.c.Remote(testChannel, node2.nodeInfo.ID)
 	require.NoError(t, err)
 
-	stream, err := rm.NewStream(time.Second * 10)
+	stream, err := rm.NewStream(time.Second*10, nil)
 	require.NoError(t, err)
 
 	err = stream.Send(&orderer.StepRequest{})
@@ -574,7 +574,7 @@ func TestUnavailableHosts(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, remote)
 
-	_, err = remote.NewStream(time.Millisecond * 100)
+	_, err = remote.NewStream(time.Millisecond*100, nil)
 	require.Contains(t, err.Error(), "connection")
 }
 
@@ -848,7 +848,7 @@ func testAbort(t *testing.T, abortFunc func(*cluster.RemoteContext), rpcTimeout 
 	var stream *cluster.Stream
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() error {
-		stream, err = rm.NewStream(rpcTimeout)
+		stream, err = rm.NewStream(rpcTimeout, nil)
 		return err
 	}, time.Second*10, time.Millisecond*10).Should(gomega.Succeed())
 
@@ -926,7 +926,7 @@ func TestReconnect(t *testing.T) {
 	// Try to obtain a stream. Should not Succeed.
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() error {
-		_, err = stub.NewStream(time.Hour)
+		_, err = stub.NewStream(time.Hour, nil)
 		return err
 	}).Should(gomega.Not(gomega.Succeed()))
 
@@ -979,7 +979,7 @@ func TestRenewCertificates(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		stream, err := remote.NewStream(time.Hour)
+		stream, err := remote.NewStream(time.Hour, nil)
 		if err != nil {
 			return err
 		}
@@ -1003,7 +1003,7 @@ func TestRenewCertificates(t *testing.T) {
 	remote, err := node1.c.Remote(testChannel, info2.ID)
 	require.NoError(t, err)
 	require.NotNil(t, remote)
-	_, err = remote.NewStream(time.Hour)
+	_, err = remote.NewStream(time.Hour, nil)
 	require.Contains(t, err.Error(), info2.Endpoint)
 
 	// Reconfigure both nodes with the updates keys
@@ -1102,7 +1102,7 @@ func TestShutdown(t *testing.T) {
 
 	// Therefore, sending a message doesn't succeed because node 1 rejected the configuration change
 	gt.Eventually(func() string {
-		stream, err := stub.NewStream(time.Hour)
+		stream, err := stub.NewStream(time.Hour, nil)
 		if err != nil {
 			return err.Error()
 		}
@@ -1177,7 +1177,7 @@ func TestMultiChannelConfig(t *testing.T) {
 
 		assertEventualSendMessage(t, node2toNode1, &orderer.SubmitRequest{Channel: "foo"})
 		require.NoError(t, err)
-		stream, err := node2toNode1.NewStream(time.Hour)
+		stream, err := node2toNode1.NewStream(time.Hour, nil)
 		require.NoError(t, err)
 		err = stream.Send(barReq)
 		require.NoError(t, err)
@@ -1185,7 +1185,7 @@ func TestMultiChannelConfig(t *testing.T) {
 		require.EqualError(t, err, "rpc error: code = Unknown desc = certificate extracted from TLS connection isn't authorized")
 
 		assertEventualSendMessage(t, node3toNode1, &orderer.SubmitRequest{Channel: "bar"})
-		stream, err = node3toNode1.NewStream(time.Hour)
+		stream, err = node3toNode1.NewStream(time.Hour, nil)
 		require.NoError(t, err)
 		err = stream.Send(fooReq)
 		require.NoError(t, err)
@@ -1511,18 +1511,18 @@ func assertEventualEstablishStream(t *testing.T, rpc *cluster.RemoteContext) *cl
 	var res *cluster.Stream
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() error {
-		stream, err := rpc.NewStream(time.Hour)
+		stream, err := rpc.NewStream(time.Hour, nil)
 		res = stream
 		return err
 	}, timeout).Should(gomega.Succeed())
 	return res
 }
 
-func assertEventualSendMessage(t *testing.T, rpc *cluster.RemoteContext, req *orderer.SubmitRequest) orderer.Cluster_StepClient {
-	var res orderer.Cluster_StepClient
+func assertEventualSendMessage(t *testing.T, rpc *cluster.RemoteContext, req *orderer.SubmitRequest) *cluster.Stream {
+	var res *cluster.Stream
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() error {
-		stream, err := rpc.NewStream(time.Hour)
+		stream, err := rpc.NewStream(time.Hour, nil)
 		if err != nil {
 			return err
 		}
