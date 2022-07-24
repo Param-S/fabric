@@ -851,8 +851,6 @@ func (rc *RemoteContext) NewStream(timeout time.Duration, Signer identity.Signer
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create new stream")
 		}
-	} else {
-		s.Logger.Debugf("New stream is created")
 	}
 
 	rc.Logger.Debugf("Created new stream to %s with ID of %d and buffer size of %d",

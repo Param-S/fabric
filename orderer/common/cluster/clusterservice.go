@@ -1,5 +1,5 @@
 /*
-Copyright IBM Corp. 2017 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
 SPDX-License-Identifier: Apache-2.0
 */
@@ -13,10 +13,10 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric-protos-go/msp"
+	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/util"
@@ -37,26 +37,28 @@ type ClusterStepStream interface {
 	grpc.ServerStream
 }
 
+/*
 type AuthRequestVerifier interface {
 	VerifyAuthRequest(orderer.ClusterNodeService_StepServer, *orderer.ClusterNodeServiceStepRequest, TLSSessionBindingGetter, SignatureVerifier) (string, error)
 }
+*/
 
-type NodeIdentity struct {
-	ID       uint64
-	Identity []byte
+type ChannelMembersConfig struct {
+	LastUpdatedTime int64
+	MemberMapping   map[uint64][]byte
 }
 
-// ClusterService defines the raft Service
+// ClusterService implements the server API for ClusterNodeService service
 type ClusterService struct {
 	StreamCountReporter              *StreamCountReporter
-	Dispatcher                       Dispatcher
+	RequestHandler                   Handler
 	Logger                           *flogging.FabricLogger
 	StepLogger                       *flogging.FabricLogger
 	MinimumExpirationWarningInterval time.Duration
 	CertExpWarningThreshold          time.Duration
-	MembershipByChannel              map[string]map[uint64]*msp.SerializedIdentity
+	MembershipByChannel              map[string]*ChannelMembersConfig
 	Lock                             sync.RWMutex
-	AuthVerifier                     AuthRequestVerifier
+	//AuthVerifier                     AuthRequestVerifier
 }
 
 type AuthRequestSignature struct {
@@ -78,7 +80,7 @@ func (s *ClusterService) Step(stream orderer.ClusterNodeService_StepServer) erro
 	s.Logger.Debugf("Connection from %s(%s)", commonName, addr)
 	defer s.Logger.Debugf("Closing connection from %s(%s)", commonName, addr)
 
-	// expect auth message is the first msg on the stream
+	// On a new stream, auth request is the first msg
 	request, err := stream.Recv()
 	if err == io.EOF {
 		s.Logger.Debugf("%s(%s) disconnected well before establishing the stream", commonName, addr)
@@ -88,14 +90,15 @@ func (s *ClusterService) Step(stream orderer.ClusterNodeService_StepServer) erro
 		s.Logger.Warningf("Stream read from %s failed: %v", addr, err)
 		return err
 	}
-	channel, err := s.AuthVerifier.VerifyAuthRequest(stream, request, GetTLSSessionBinding, VerifySignature)
+	//channel, err := s.AuthVerifier.VerifyAuthRequest(stream, request, GetTLSSessionBinding, VerifySignature)
+	authReq, configUpdatedTime, err := s.VerifyAuthRequest(stream, request)
 	if err != nil {
 		s.Logger.Warnf("service authentication failed with error: %v", err)
 		return status.Errorf(codes.Unauthenticated, "access denied")
 	}
 
 	for {
-		err := s.handleMessage(stream, addr, exp, channel)
+		err := s.handleMessage(stream, addr, exp, authReq.Channel, authReq.FromId, configUpdatedTime)
 		if err == io.EOF {
 			s.Logger.Debugf("%s(%s) disconnected", commonName, addr)
 			return nil
@@ -107,26 +110,29 @@ func (s *ClusterService) Step(stream orderer.ClusterNodeService_StepServer) erro
 	}
 }
 
+/*
 type (
 	TLSSessionBindingGetter func(grpc.Stream, []byte) ([]byte, error)
 	SignatureVerifier       func(identity []byte, msgHash []byte, signature []byte) error
 )
+*/
 
-func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_StepServer, request *orderer.ClusterNodeServiceStepRequest, tlsBindingGetter TLSSessionBindingGetter, signatureVerifier SignatureVerifier) (string, error) {
+//func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_StepServer, request *orderer.ClusterNodeServiceStepRequest, tlsBindingGetter TLSSessionBindingGetter, signatureVerifier SignatureVerifier) (orderer.NodeAuthRequest, error) {
+func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_StepServer, request *orderer.ClusterNodeServiceStepRequest) (*orderer.NodeAuthRequest, int64, error) {
 	authReq := request.GetNodeAuthrequest()
 	if authReq == nil {
-		return "", errors.New("invalid request object")
+		return nil, -1, errors.New("invalid request object")
 	}
 
 	bindingFieldsHash := GetSessionBindingHash(authReq)
 
-	tlsBinding, err := tlsBindingGetter(stream, bindingFieldsHash)
+	tlsBinding, err := GetTLSSessionBinding(stream, bindingFieldsHash)
 	if err != nil {
-		return authReq.Channel, errors.Wrap(err, "session binding read failed")
+		return nil, -1, errors.Wrap(err, "session binding read failed")
 	}
 
 	if bytes.Equal(tlsBinding, authReq.SessionBinding) {
-		return authReq.Channel, errors.New("session binding mismatch")
+		return nil, -1, errors.New("session binding mismatch")
 	}
 
 	msg, err := asn1.Marshal(AuthRequestSignature{
@@ -137,25 +143,25 @@ func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_Ste
 		Channel:   authReq.Channel,
 	})
 	if err != nil {
-		return authReq.Channel, errors.Wrap(err, "ASN encoding failed")
+		return nil, -1, errors.Wrap(err, "ASN encoding failed")
 	}
 
 	s.Lock.RLock()
 	defer s.Lock.RUnlock()
-	identity := s.MembershipByChannel[authReq.Channel][authReq.FromId]
+	identity := s.MembershipByChannel[authReq.Channel].MemberMapping[authReq.FromId]
 	if identity == nil {
-		return authReq.Channel, errors.Errorf("node %d is not member of channel %s", authReq.FromId, authReq.Channel)
+		return nil, -1, errors.Errorf("node %d is not member of channel %s", authReq.FromId, authReq.Channel)
 	}
 
-	err = signatureVerifier(identity.IdBytes, msg, authReq.Signature)
+	err = VerifySignature(identity, msg, authReq.Signature)
 	if err != nil {
-		return authReq.Channel, errors.Wrap(err, "signature mismatch")
+		return nil, -1, errors.Wrap(err, "signature mismatch")
 	}
 
-	return authReq.Channel, nil
+	return authReq, atomic.LoadInt64(&s.MembershipByChannel[authReq.Channel].LastUpdatedTime), nil
 }
 
-func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, exp *certificateExpirationCheck, channel string) error {
+func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, exp *certificateExpirationCheck, channel string, sender uint64, streamRefTime int64) error {
 	request, err := stream.Recv()
 	if err == io.EOF {
 		return err
@@ -167,6 +173,10 @@ func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, ex
 	if request == nil {
 		return errors.Errorf("Request message is nil")
 	}
+	if streamRefTime != atomic.LoadInt64(&s.MembershipByChannel[channel].LastUpdatedTime) {
+		return io.EOF
+	}
+
 	if s.StepLogger.IsEnabledFor(zap.DebugLevel) {
 		nodeName := commonNameFromContext(stream.Context())
 		s.StepLogger.Debugf("Received message from %s(%s): %v", nodeName, addr, clusterRequestAsString(request))
@@ -174,19 +184,26 @@ func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, ex
 
 	exp.checkExpiration(time.Now(), channel)
 
-	if submitReq := request.GetNodeTranrequest(); submitReq != nil {
-		return s.handleSubmit(submitReq, stream, addr, channel)
+	if tranReq := request.GetNodeTranrequest(); tranReq != nil {
+		submitReq := &orderer.SubmitRequest{
+			Channel:           channel,
+			LastValidationSeq: tranReq.LastValidationSeq,
+			Payload:           tranReq.Payload,
+		}
+		return s.RequestHandler.OnSubmit(channel, sender, submitReq)
 	} else if clusterConReq := request.GetNodeConrequest(); clusterConReq != nil {
 		conReq := &orderer.ConsensusRequest{
 			Channel:  channel,
 			Payload:  clusterConReq.Payload,
 			Metadata: clusterConReq.Metadata,
 		}
-		return s.Dispatcher.DispatchConsensus(stream.Context(), conReq)
+		return s.RequestHandler.OnConsensus(channel, sender, conReq)
+		//return s.Dispatcher.DispatchConsensus(stream.Context(), conReq)
 	}
 	return errors.Errorf("Message is neither a Submit nor Consensus request")
 }
 
+/*
 func (s *ClusterService) handleSubmit(request *orderer.NodeTransactionOrderRequest, stream ClusterStepStream, addr string, channel string) error {
 	submitReq := &orderer.SubmitRequest{
 		Channel:           channel,
@@ -200,6 +217,7 @@ func (s *ClusterService) handleSubmit(request *orderer.NodeTransactionOrderReque
 	}
 	return err
 }
+*/
 
 func (s *ClusterService) initializeExpirationCheck(stream orderer.ClusterNodeService_StepServer, endpoint, nodeName string) *certificateExpirationCheck {
 	expiresAt := time.Time{}
@@ -220,7 +238,7 @@ func (s *ClusterService) initializeExpirationCheck(stream orderer.ClusterNodeSer
 	}
 }
 
-func (c *ClusterService) ConfigureNodeCerts(channel string, newNodes []NodeIdentity) error {
+func (c *ClusterService) ConfigureNodeCerts(channel string, newNodes []common.Consenter) error {
 	if c.MembershipByChannel == nil {
 		return errors.New("Nodes cert storage is not initialized")
 	}
@@ -235,11 +253,11 @@ func (c *ClusterService) ConfigureNodeCerts(channel string, newNodes []NodeIdent
 		c.Logger.Debugf("Refreshing the %s channel nodes identities", channel)
 		delete(c.MembershipByChannel, channel)
 	}
-	channelCert = make(map[uint64]*msp.SerializedIdentity)
+	channelCert = &ChannelMembersConfig{}
+	atomic.StoreInt64(&channelCert.LastUpdatedTime, time.Now().UnixNano())
+	channelCert.MemberMapping = make(map[uint64][]byte)
 	for _, nodeIdentity := range newNodes {
-		sID := &msp.SerializedIdentity{}
-		proto.Unmarshal(nodeIdentity.Identity, sID)
-		channelCert[nodeIdentity.ID] = sID
+		channelCert.MemberMapping[uint64(nodeIdentity.Id)] = nodeIdentity.Identity
 	}
 	c.MembershipByChannel[channel] = channelCert
 	return nil
