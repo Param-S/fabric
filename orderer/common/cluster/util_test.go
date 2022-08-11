@@ -1481,21 +1481,16 @@ func TestGetTLSSessionBinding(t *testing.T) {
 	serverCert, err := ca.NewServerCertKeyPair("127.0.0.1")
 	require.NoError(t, err)
 
-	clientCert, err := ca.NewClientCertKeyPair()
-	require.NoError(t, err)
 	srv, err := comm.NewGRPCServer("127.0.0.1:0", comm.ServerConfig{
 		SecOpts: comm.SecureOptions{
-			Certificate:       serverCert.Cert,
-			Key:               serverCert.Key,
-			UseTLS:            true,
-			ClientRootCAs:     [][]byte{ca.CertBytes()},
-			RequireClientCert: true,
+			Certificate: serverCert.Cert,
+			Key:         serverCert.Key,
+			UseTLS:      true,
 		},
 	})
 	require.NoError(t, err)
 
-	dispatcher := &mocks.Dispatcher{}
-	dispatcher.On("DispatchConsensus", mock.Anything, mock.Anything).Return(nil)
+	handler := &mocks.Handler{}
 
 	svc := &cluster.ClusterService{
 		MinimumExpirationWarningInterval: time.Second * 2,
@@ -1504,9 +1499,8 @@ func TestGetTLSSessionBinding(t *testing.T) {
 		},
 		Logger:              flogging.MustGetLogger("test"),
 		StepLogger:          flogging.MustGetLogger("test"),
-		Dispatcher:          dispatcher,
-		MembershipByChannel: make(map[string]map[uint64]*msp.SerializedIdentity),
-		AuthVerifier:        &AuthVerifier{},
+		RequestHandler:      handler,
+		MembershipByChannel: make(map[string]*cluster.ChannelMembersConfig),
 	}
 
 	orderer.RegisterClusterNodeServiceServer(srv.Server(), svc)
@@ -1516,11 +1510,8 @@ func TestGetTLSSessionBinding(t *testing.T) {
 	clientConf := comm.ClientConfig{
 		DialTimeout: time.Second * 3,
 		SecOpts: comm.SecureOptions{
-			ServerRootCAs:     [][]byte{ca.CertBytes()},
-			UseTLS:            true,
-			Key:               clientCert.Key,
-			Certificate:       clientCert.Cert,
-			RequireClientCert: true,
+			ServerRootCAs: [][]byte{ca.CertBytes()},
+			UseTLS:        true,
 		},
 	}
 	conn, err := clientConf.Dial(srv.Address())
@@ -1530,7 +1521,7 @@ func TestGetTLSSessionBinding(t *testing.T) {
 	stream, err := cl.Step(context.Background())
 	require.NoError(t, err)
 
-	binding, err := cluster.GetTLSSessionBinding(stream, []byte{1, 2, 3, 4, 5})
+	binding, err := cluster.GetTLSSessionBinding(stream.Context(), []byte{1, 2, 3, 4, 5})
 	require.NoError(t, err)
 	require.Len(t, binding, 32)
 }

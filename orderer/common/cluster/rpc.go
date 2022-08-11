@@ -157,9 +157,7 @@ func (s *RPC) getOrCreateStream(destination uint64, operationType OperationType)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	stub.SourceNodeID = s.SourceNodeID
-	stub.DestinationNodeID = destination
-	stream, err = stub.NewStream(s.Timeout, s.Signer)
+	stream, err = stub.NewStream(s.Timeout)
 	if err != nil {
 		return nil, err
 	}

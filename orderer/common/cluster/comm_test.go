@@ -255,10 +255,14 @@ func newTestNodeWithMetrics(t *testing.T, metrics cluster.MetricsProvider, tlsCo
 		bindAddress:  gRPCServer.Address(),
 		handler:      handler,
 		nodeInfo: cluster.RemoteNode{
-			Endpoint:      gRPCServer.Address(),
-			ID:            nextUnusedID(),
-			ServerTLSCert: serverKeyPair.TLSCert.Raw,
-			ClientTLSCert: clientKeyPair.TLSCert.Raw,
+			NodeAddress: cluster.NodeAddress{
+				Endpoint: gRPCServer.Address(),
+				ID:       nextUnusedID(),
+			},
+			NodeCerts: cluster.NodeCerts{
+				ServerTLSCert: serverKeyPair.TLSCert.Raw,
+				ClientTLSCert: clientKeyPair.TLSCert.Raw,
+			},
 		},
 		srv: gRPCServer,
 	}
@@ -283,6 +287,7 @@ func newTestNodeWithMetrics(t *testing.T, metrics cluster.MetricsProvider, tlsCo
 		Connections:             cluster.NewConnectionStore(dialer, tlsConnGauge),
 		Metrics:                 cluster.NewMetrics(metrics),
 		CompareCertificate:      compareCert,
+		NodeID:                  tstSrv.nodeInfo.ID,
 	}
 
 	orderer.RegisterClusterServer(gRPCServer.Server(), tstSrv.dispatcher)
@@ -424,21 +429,25 @@ func TestBlockingSend(t *testing.T) {
 			config := []cluster.RemoteNode{node1.nodeInfo, node2.nodeInfo}
 			node1.c.Configure(testChannel, config)
 			node2.c.Configure(testChannel, config)
+			node2.handler.On("OnSubmit", testChannel, node1.nodeInfo.ID, mock.Anything).Return(errors.Errorf("whoops")).Once()
 
 			rm, err := node1.c.Remote(testChannel, node2.nodeInfo.ID)
 			require.NoError(t, err)
 
-			client := &mocks.ClusterClient{}
-			fakeStream := &mocks.StepClient{}
+			// client := &mocks.ClusterClient{}
+			fakeStream := &mocks.StepClientStream{}
+			rm.GetStreamFunc = func(ctx context.Context) (cluster.StepClientStream, error) {
+				return fakeStream, nil
+			}
 
-			// Replace real client with a mock client
-			rm.Client = client
 			rm.ProbeConn = func(_ *grpc.ClientConn) error {
 				return nil
 			}
 			// Configure client to return the mock stream
 			fakeStream.On("Context", mock.Anything).Return(context.Background())
-			client.On("Step", mock.Anything).Return(fakeStream, nil).Once()
+			// Auth(uint32, uint64, uint64, string, identity.Signer) error
+			fakeStream.On("Auth", uint32(0x0), node1.nodeInfo.ID, node2.nodeInfo.ID, testChannel, nil).Return(nil).Once()
+			// client.On("Step", mock.Anything).Return(fakeStream, nil).Once()
 
 			unBlock := make(chan struct{})
 			var sendInvoked sync.WaitGroup
@@ -449,7 +458,7 @@ func TestBlockingSend(t *testing.T) {
 				<-unBlock
 			}).Return(errors.New("oops"))
 
-			stream, err := rm.NewStream(time.Hour, nil)
+			stream, err := rm.NewStream(time.Hour)
 			require.NoError(t, err)
 
 			// The first send doesn't block, even though the Send operation blocks.
@@ -527,7 +536,7 @@ func TestEmptyRequest(t *testing.T) {
 	rm, err := node1.c.Remote(testChannel, node2.nodeInfo.ID)
 	require.NoError(t, err)
 
-	stream, err := rm.NewStream(time.Second*10, nil)
+	stream, err := rm.NewStream(time.Second * 10)
 	require.NoError(t, err)
 
 	err = stream.Send(&orderer.StepRequest{})
@@ -574,7 +583,7 @@ func TestUnavailableHosts(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, remote)
 
-	_, err = remote.NewStream(time.Millisecond*100, nil)
+	_, err = remote.NewStream(time.Millisecond * 100)
 	require.Contains(t, err.Error(), "connection")
 }
 
@@ -639,9 +648,11 @@ func TestStreamAbort(t *testing.T) {
 	defer node2.stop()
 
 	invalidNodeInfo := cluster.RemoteNode{
-		ID:            node2.nodeInfo.ID,
-		ServerTLSCert: []byte{1, 2, 3},
-		ClientTLSCert: []byte{1, 2, 3},
+		NodeAddress: cluster.NodeAddress{ID: node2.nodeInfo.ID},
+		NodeCerts: cluster.NodeCerts{
+			ServerTLSCert: []byte{1, 2, 3},
+			ClientTLSCert: []byte{1, 2, 3},
+		},
 	}
 
 	for _, tst := range []struct {
@@ -848,7 +859,7 @@ func testAbort(t *testing.T, abortFunc func(*cluster.RemoteContext), rpcTimeout 
 	var stream *cluster.Stream
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() error {
-		stream, err = rm.NewStream(rpcTimeout, nil)
+		stream, err = rm.NewStream(rpcTimeout)
 		return err
 	}, time.Second*10, time.Millisecond*10).Should(gomega.Succeed())
 
@@ -926,7 +937,7 @@ func TestReconnect(t *testing.T) {
 	// Try to obtain a stream. Should not Succeed.
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() error {
-		_, err = stub.NewStream(time.Hour, nil)
+		_, err = stub.NewStream(time.Hour)
 		return err
 	}).Should(gomega.Not(gomega.Succeed()))
 
@@ -979,7 +990,7 @@ func TestRenewCertificates(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		stream, err := remote.NewStream(time.Hour, nil)
+		stream, err := remote.NewStream(time.Hour)
 		if err != nil {
 			return err
 		}
@@ -1003,7 +1014,7 @@ func TestRenewCertificates(t *testing.T) {
 	remote, err := node1.c.Remote(testChannel, info2.ID)
 	require.NoError(t, err)
 	require.NotNil(t, remote)
-	_, err = remote.NewStream(time.Hour, nil)
+	_, err = remote.NewStream(time.Hour)
 	require.Contains(t, err.Error(), info2.Endpoint)
 
 	// Reconfigure both nodes with the updates keys
@@ -1102,7 +1113,7 @@ func TestShutdown(t *testing.T) {
 
 	// Therefore, sending a message doesn't succeed because node 1 rejected the configuration change
 	gt.Eventually(func() string {
-		stream, err := stub.NewStream(time.Hour, nil)
+		stream, err := stub.NewStream(time.Hour)
 		if err != nil {
 			return err.Error()
 		}
@@ -1177,7 +1188,7 @@ func TestMultiChannelConfig(t *testing.T) {
 
 		assertEventualSendMessage(t, node2toNode1, &orderer.SubmitRequest{Channel: "foo"})
 		require.NoError(t, err)
-		stream, err := node2toNode1.NewStream(time.Hour, nil)
+		stream, err := node2toNode1.NewStream(time.Hour)
 		require.NoError(t, err)
 		err = stream.Send(barReq)
 		require.NoError(t, err)
@@ -1185,7 +1196,7 @@ func TestMultiChannelConfig(t *testing.T) {
 		require.EqualError(t, err, "rpc error: code = Unknown desc = certificate extracted from TLS connection isn't authorized")
 
 		assertEventualSendMessage(t, node3toNode1, &orderer.SubmitRequest{Channel: "bar"})
-		stream, err = node3toNode1.NewStream(time.Hour, nil)
+		stream, err = node3toNode1.NewStream(time.Hour)
 		require.NoError(t, err)
 		err = stream.Send(fooReq)
 		require.NoError(t, err)
@@ -1426,13 +1437,13 @@ func TestCertExpirationWarningEgress(t *testing.T) {
 	stub, err := node1.c.Remote(testChannel, node2.nodeInfo.ID)
 	require.NoError(t, err)
 
+	node2.handler.On("OnSubmit", testChannel, node1.nodeInfo.ID, mock.Anything).Return(nil)
+
 	mockgRPC := &mocks.StepClient{}
 	mockgRPC.On("Send", mock.Anything).Return(nil)
 	mockgRPC.On("Context").Return(context.Background())
 	mockClient := &mocks.ClusterClient{}
 	mockClient.On("Step", mock.Anything).Return(mockgRPC, nil)
-
-	stub.Client = mockClient
 
 	stream := assertEventualEstablishStream(t, stub)
 
@@ -1511,7 +1522,7 @@ func assertEventualEstablishStream(t *testing.T, rpc *cluster.RemoteContext) *cl
 	var res *cluster.Stream
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() error {
-		stream, err := rpc.NewStream(time.Hour, nil)
+		stream, err := rpc.NewStream(time.Hour)
 		res = stream
 		return err
 	}, timeout).Should(gomega.Succeed())
@@ -1522,7 +1533,7 @@ func assertEventualSendMessage(t *testing.T, rpc *cluster.RemoteContext, req *or
 	var res *cluster.Stream
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() error {
-		stream, err := rpc.NewStream(time.Hour, nil)
+		stream, err := rpc.NewStream(time.Hour)
 		if err != nil {
 			return err
 		}

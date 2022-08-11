@@ -37,12 +37,6 @@ type ClusterStepStream interface {
 	grpc.ServerStream
 }
 
-/*
-type AuthRequestVerifier interface {
-	VerifyAuthRequest(orderer.ClusterNodeService_StepServer, *orderer.ClusterNodeServiceStepRequest, TLSSessionBindingGetter, SignatureVerifier) (string, error)
-}
-*/
-
 type ChannelMembersConfig struct {
 	LastUpdatedTime int64
 	MemberMapping   map[uint64][]byte
@@ -58,7 +52,6 @@ type ClusterService struct {
 	CertExpWarningThreshold          time.Duration
 	MembershipByChannel              map[string]*ChannelMembersConfig
 	Lock                             sync.RWMutex
-	//AuthVerifier                     AuthRequestVerifier
 }
 
 type AuthRequestSignature struct {
@@ -90,7 +83,7 @@ func (s *ClusterService) Step(stream orderer.ClusterNodeService_StepServer) erro
 		s.Logger.Warningf("Stream read from %s failed: %v", addr, err)
 		return err
 	}
-	//channel, err := s.AuthVerifier.VerifyAuthRequest(stream, request, GetTLSSessionBinding, VerifySignature)
+
 	authReq, configUpdatedTime, err := s.VerifyAuthRequest(stream, request)
 	if err != nil {
 		s.Logger.Warnf("service authentication failed with error: %v", err)
@@ -110,14 +103,6 @@ func (s *ClusterService) Step(stream orderer.ClusterNodeService_StepServer) erro
 	}
 }
 
-/*
-type (
-	TLSSessionBindingGetter func(grpc.Stream, []byte) ([]byte, error)
-	SignatureVerifier       func(identity []byte, msgHash []byte, signature []byte) error
-)
-*/
-
-//func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_StepServer, request *orderer.ClusterNodeServiceStepRequest, tlsBindingGetter TLSSessionBindingGetter, signatureVerifier SignatureVerifier) (orderer.NodeAuthRequest, error) {
 func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_StepServer, request *orderer.ClusterNodeServiceStepRequest) (*orderer.NodeAuthRequest, int64, error) {
 	authReq := request.GetNodeAuthrequest()
 	if authReq == nil {
@@ -126,12 +111,12 @@ func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_Ste
 
 	bindingFieldsHash := GetSessionBindingHash(authReq)
 
-	tlsBinding, err := GetTLSSessionBinding(stream, bindingFieldsHash)
+	tlsBinding, err := GetTLSSessionBinding(stream.Context(), bindingFieldsHash)
 	if err != nil {
 		return nil, -1, errors.Wrap(err, "session binding read failed")
 	}
 
-	if bytes.Equal(tlsBinding, authReq.SessionBinding) {
+	if !bytes.Equal(tlsBinding, authReq.SessionBinding) {
 		return nil, -1, errors.New("session binding mismatch")
 	}
 
@@ -148,7 +133,12 @@ func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_Ste
 
 	s.Lock.RLock()
 	defer s.Lock.RUnlock()
-	identity := s.MembershipByChannel[authReq.Channel].MemberMapping[authReq.FromId]
+	membership := s.MembershipByChannel[authReq.Channel]
+	if membership == nil {
+		return nil, -1, errors.Errorf("channel %s not found in config", authReq.Channel)
+	}
+
+	identity := membership.MemberMapping[authReq.FromId]
 	if identity == nil {
 		return nil, -1, errors.Errorf("node %d is not member of channel %s", authReq.FromId, authReq.Channel)
 	}
@@ -198,26 +188,9 @@ func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, ex
 			Metadata: clusterConReq.Metadata,
 		}
 		return s.RequestHandler.OnConsensus(channel, sender, conReq)
-		//return s.Dispatcher.DispatchConsensus(stream.Context(), conReq)
 	}
 	return errors.Errorf("Message is neither a Submit nor Consensus request")
 }
-
-/*
-func (s *ClusterService) handleSubmit(request *orderer.NodeTransactionOrderRequest, stream ClusterStepStream, addr string, channel string) error {
-	submitReq := &orderer.SubmitRequest{
-		Channel:           channel,
-		LastValidationSeq: request.LastValidationSeq,
-		Payload:           request.Payload,
-	}
-	err := s.Dispatcher.DispatchSubmit(stream.Context(), submitReq)
-	if err != nil {
-		s.Logger.Warningf("Handling of Submit() from %s failed: %v", addr, err)
-		return err
-	}
-	return err
-}
-*/
 
 func (s *ClusterService) initializeExpirationCheck(stream orderer.ClusterNodeService_StepServer, endpoint, nodeName string) *certificateExpirationCheck {
 	expiresAt := time.Time{}

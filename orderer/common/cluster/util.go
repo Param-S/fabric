@@ -8,6 +8,7 @@ package cluster
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -941,8 +942,8 @@ func GetSessionBindingHash(authReq *orderer.NodeAuthRequest) []byte {
 	))
 }
 
-func GetTLSSessionBinding(stream grpc.Stream, bindingPayload []byte) ([]byte, error) {
-	peerInfo, ok := peer.FromContext(stream.Context())
+func GetTLSSessionBinding(ctx context.Context, bindingPayload []byte) ([]byte, error) {
+	peerInfo, ok := peer.FromContext(ctx)
 	if !ok {
 		return nil, errors.New("failed extracting stream context")
 	}
@@ -978,4 +979,20 @@ func VerifySignature(identity, msgHash, signature []byte) error {
 		return errors.New("signature invalid")
 	}
 	return nil
+}
+
+func requestAsString(request *orderer.StepRequest) string {
+	switch t := request.GetPayload().(type) {
+	case *orderer.StepRequest_SubmitRequest:
+		if t.SubmitRequest == nil || t.SubmitRequest.Payload == nil {
+			return fmt.Sprintf("Empty SubmitRequest: %v", t.SubmitRequest)
+		}
+		return fmt.Sprintf("SubmitRequest for channel %s with payload of size %d",
+			t.SubmitRequest.Channel, len(t.SubmitRequest.Payload.Payload))
+	case *orderer.StepRequest_ConsensusRequest:
+		return fmt.Sprintf("ConsensusRequest for channel %s with payload of size %d",
+			t.ConsensusRequest.Channel, len(t.ConsensusRequest.Payload))
+	default:
+		return fmt.Sprintf("unknown type: %v", request)
+	}
 }
