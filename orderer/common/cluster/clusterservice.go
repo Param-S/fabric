@@ -55,11 +55,12 @@ type ClusterService struct {
 }
 
 type AuthRequestSignature struct {
-	Version   int64
-	Timestamp string
-	FromId    string
-	ToId      string
-	Channel   string
+	Version        int64
+	Timestamp      string
+	FromId         string
+	ToId           string
+	Channel        string
+	SessionBinding []byte
 }
 
 // Step passes an implementation-specific message to another cluster member.
@@ -121,11 +122,12 @@ func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_Ste
 	}
 
 	msg, err := asn1.Marshal(AuthRequestSignature{
-		Version:   int64(authReq.Version),
-		Timestamp: authReq.Timestamp.String(),
-		FromId:    strconv.FormatUint(authReq.FromId, 10),
-		ToId:      strconv.FormatUint(authReq.ToId, 10),
-		Channel:   authReq.Channel,
+		Version:        int64(authReq.Version),
+		Timestamp:      authReq.Timestamp.String(),
+		FromId:         strconv.FormatUint(authReq.FromId, 10),
+		ToId:           strconv.FormatUint(authReq.ToId, 10),
+		SessionBinding: tlsBinding,
+		Channel:        authReq.Channel,
 	})
 	if err != nil {
 		return nil, -1, errors.Wrap(err, "ASN encoding failed")
@@ -163,8 +165,10 @@ func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, ex
 	if request == nil {
 		return errors.Errorf("Request message is nil")
 	}
+
 	if streamRefTime != atomic.LoadInt64(&s.MembershipByChannel[channel].LastUpdatedTime) {
-		return io.EOF
+		s.Logger.Debugf("Channel %s stream is stale", channel)
+		return errors.New("stream is stale")
 	}
 
 	if s.StepLogger.IsEnabledFor(zap.DebugLevel) {

@@ -14,7 +14,6 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -38,9 +37,6 @@ type RemoteContext struct {
 	nextStreamID                     uint64
 	streamsByID                      streamsMapperReporter
 	workerCountReporter              workerCountReporter
-	SourceNodeID                     uint64
-	DestinationNodeID                uint64
-	Signer                           identity.Signer
 }
 
 // NewStream creates a new stream.
@@ -113,7 +109,7 @@ func (rc *RemoteContext) NewStream(timeout time.Duration) (*Stream, error) {
 		},
 	}
 
-	err = stream.Auth(0, rc.SourceNodeID, rc.DestinationNodeID, rc.Channel, rc.Signer)
+	err = stream.Auth()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create new stream")
 	}

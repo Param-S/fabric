@@ -12,7 +12,6 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-protos-go/orderer"
-	"github.com/hyperledger/fabric/internal/pkg/identity"
 )
 
 //go:generate mockery -dir . -name Communicator -case underscore -output ./mocks/
@@ -50,6 +49,8 @@ type NodeCerts struct {
 	ServerTLSCert []byte
 	// ClientTLSCert is the DER encoded TLS client certificate of the node
 	ClientTLSCert []byte
+	// PEM-encoded X509 certificate authority to verify server certificates
+	ServerRootCA []byte
 }
 
 type NodeAddress struct {
@@ -67,8 +68,8 @@ type RemoteNode struct {
 
 // String returns a string representation of this RemoteNode
 func (rm RemoteNode) String() string {
-	return fmt.Sprintf("ID: %d,\nEndpoint: %s,\nServerTLSCert:%s, ClientTLSCert:%s",
-		rm.ID, rm.Endpoint, DERtoPEM(rm.ServerTLSCert), DERtoPEM(rm.ClientTLSCert))
+	return fmt.Sprintf("ID: %d,\nEndpoint: %s,\nServerTLSCert:%s,\nClientTLSCert:%s, ServerRootCA: %s",
+		rm.ID, rm.Endpoint, DERtoPEM(rm.ServerTLSCert), DERtoPEM(rm.ClientTLSCert), rm.ServerRootCA)
 }
 
 // go:generate mockery -dir . -name StepClientStream -case underscore -output ./mocks/
@@ -76,6 +77,6 @@ func (rm RemoteNode) String() string {
 type StepClientStream interface {
 	Send(request *orderer.StepRequest) error
 	Recv() (*orderer.StepResponse, error)
-	Auth(uint32, uint64, uint64, string, identity.Signer) error
+	Auth() error
 	Context() context.Context
 }

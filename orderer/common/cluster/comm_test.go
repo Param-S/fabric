@@ -434,7 +434,6 @@ func TestBlockingSend(t *testing.T) {
 			rm, err := node1.c.Remote(testChannel, node2.nodeInfo.ID)
 			require.NoError(t, err)
 
-			// client := &mocks.ClusterClient{}
 			fakeStream := &mocks.StepClientStream{}
 			rm.GetStreamFunc = func(ctx context.Context) (cluster.StepClientStream, error) {
 				return fakeStream, nil
@@ -443,11 +442,9 @@ func TestBlockingSend(t *testing.T) {
 			rm.ProbeConn = func(_ *grpc.ClientConn) error {
 				return nil
 			}
-			// Configure client to return the mock stream
+
 			fakeStream.On("Context", mock.Anything).Return(context.Background())
-			// Auth(uint32, uint64, uint64, string, identity.Signer) error
-			fakeStream.On("Auth", uint32(0x0), node1.nodeInfo.ID, node2.nodeInfo.ID, testChannel, nil).Return(nil).Once()
-			// client.On("Step", mock.Anything).Return(fakeStream, nil).Once()
+			fakeStream.On("Auth").Return(nil).Once()
 
 			unBlock := make(chan struct{})
 			var sendInvoked sync.WaitGroup

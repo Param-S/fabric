@@ -122,9 +122,7 @@ func TestRPCChangeDestination(t *testing.T) {
 		GetStreamFunc: func(ctx context.Context) (cluster.StepClientStream, error) {
 			return fakeStream1, nil
 		},
-		SourceNodeID:      1,
-		DestinationNodeID: 2,
-		Channel:           "mychannel",
+		Channel: "mychannel",
 	}, nil)
 
 	comm.On("Remote", "mychannel", uint64(2)).Return(&cluster.RemoteContext{
@@ -135,9 +133,7 @@ func TestRPCChangeDestination(t *testing.T) {
 		GetStreamFunc: func(ctx context.Context) (cluster.StepClientStream, error) {
 			return fakeStream2, nil
 		},
-		SourceNodeID:      2,
-		DestinationNodeID: 1,
-		Channel:           "mychannel",
+		Channel: "mychannel",
 	}, nil)
 
 	rpc := &cluster.RPC{
@@ -156,12 +152,12 @@ func TestRPCChangeDestination(t *testing.T) {
 	}
 
 	fakeStream1.On("Context", mock.Anything).Return(context.Background())
-	fakeStream1.On("Auth", uint32(0x0), uint64(1), uint64(2), "mychannel", nil).Return(nil).Once()
+	fakeStream1.On("Auth").Return(nil).Once()
 	fakeStream1.On("Send", mock.Anything).Return(nil).Run(signalSent).Once()
 	fakeStream1.On("Recv").Return(nil, io.EOF)
 
 	fakeStream2.On("Context", mock.Anything).Return(context.Background())
-	fakeStream2.On("Auth", uint32(0x0), uint64(2), uint64(1), "mychannel", nil).Return(nil).Once()
+	fakeStream2.On("Auth").Return(nil).Once()
 	fakeStream2.On("Send", mock.Anything).Return(nil).Run(signalSent).Once()
 	fakeStream2.On("Recv").Return(nil, io.EOF)
 
@@ -222,7 +218,7 @@ func TestSend(t *testing.T) {
 
 	fakeStream1 := &mocks.StepClientStream{}
 	fakeStream1.On("Context", mock.Anything).Return(context.Background())
-	fakeStream1.On("Auth", uint32(0x0), uint64(1), uint64(2), "mychannel", nil).Return(nil)
+	fakeStream1.On("Auth").Return(nil)
 	fakeStream1.On("Send", mock.Anything).Return(func(*orderer.StepRequest) error {
 		l.Lock()
 		defer l.Unlock()
@@ -288,9 +284,7 @@ func TestSend(t *testing.T) {
 				GetStreamFunc: func(ctx context.Context) (cluster.StepClientStream, error) {
 					return fakeStream1, nil
 				},
-				SourceNodeID:      1,
-				DestinationNodeID: 2,
-				Channel:           "mychannel",
+				Channel: "mychannel",
 			}
 			defer rm.Abort()
 			comm.On("Remote", "mychannel", uint64(1)).Return(rm, testCase.remoteError)
@@ -341,9 +335,7 @@ func TestRPCGarbageCollection(t *testing.T) {
 		GetStreamFunc: func(ctx context.Context) (cluster.StepClientStream, error) {
 			return fakeStream1, nil
 		},
-		SourceNodeID:      1,
-		DestinationNodeID: 2,
-		Channel:           "mychannel",
+		Channel: "mychannel",
 	}
 
 	var sent sync.WaitGroup
@@ -352,7 +344,7 @@ func TestRPCGarbageCollection(t *testing.T) {
 		sent.Add(1)
 		comm.On("Remote", "mychannel", destination).Return(remote, nil)
 		fakeStream1.On("Context", mock.Anything).Return(context.Background())
-		fakeStream1.On("Auth", uint32(0x0), uint64(1), uint64(2), "mychannel", nil).Return(nil)
+		fakeStream1.On("Auth").Return(nil)
 		fakeStream1.On("Send", mock.Anything).Return(nil).Run(func(_ mock.Arguments) {
 			sent.Done()
 		}).Once()

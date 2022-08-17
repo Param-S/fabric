@@ -41,8 +41,8 @@ import (
 	"google.golang.org/grpc/peer"
 )
 
-//
-const KeyingMaterialLabel = "EXPERIMENTAL label for orderer"
+// Lable used for TLS Export Keying Material call
+const KeyingMaterialLabel = "orderer v3 authentication label"
 
 // ConnByCertMap maps certificates represented as strings
 // to gRPC connections

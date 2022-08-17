@@ -327,9 +327,6 @@ func (c *Comm) createRemoteContext(stub *Stub, channel string) func() (*RemoteCo
 			ProbeConn:                        probeConnection,
 			conn:                             conn,
 			GetStreamFunc:                    getStream,
-			SourceNodeID:                     c.NodeID,
-			DestinationNodeID:                stub.ID,
-			Signer:                           c.Signer,
 		}
 		return rc, nil
 	}
@@ -405,7 +402,7 @@ func (cs *CommClientStream) Recv() (*orderer.StepResponse, error) {
 	return cs.StepClient.Recv()
 }
 
-func (cs *CommClientStream) Auth(version uint32, fromId uint64, toId uint64, channel string, signer identity.Signer) error {
+func (cs *CommClientStream) Auth() error {
 	return nil
 }
 

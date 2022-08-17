@@ -69,7 +69,7 @@ func (ac *AuthCommMgr) Remote(channel string, id uint64) (*RemoteContext, error)
 	return stub.RemoteContext, nil
 }
 
-func (ac *AuthCommMgr) Configure(channel string, members []NodeAddress) {
+func (ac *AuthCommMgr) Configure(channel string, members []RemoteNode) {
 	ac.Logger.Infof("Configuring communication module for Channel: %s with nodes:%v", channel, members)
 
 	ac.Lock.Lock()
@@ -101,6 +101,7 @@ func (ac *AuthCommMgr) Configure(channel string, members []NodeAddress) {
 		ac.Logger.Infof("Deactivated node %v who's endpoint is %v", id, stub.Endpoint)
 		mapping.Remove(id)
 		stub.Deactivate()
+		ac.Connections.Disconnect(stub.Endpoint)
 	})
 }
 
@@ -135,7 +136,7 @@ func (ac *AuthCommMgr) getOrCreateMapping(channel string) MemberMapping {
 }
 
 // updateStubInMapping updates the given RemoteNode and adds it to the MemberMapping
-func (ac *AuthCommMgr) updateStubInMapping(channel string, mapping MemberMapping, node NodeAddress) {
+func (ac *AuthCommMgr) updateStubInMapping(channel string, mapping MemberMapping, node RemoteNode) {
 	stub := mapping.ByID(node.ID)
 	if stub == nil {
 		ac.Logger.Infof("Allocating a new stub for node %v with endpoint %v for channel %s", node.ID, node.Endpoint, channel)
@@ -143,7 +144,7 @@ func (ac *AuthCommMgr) updateStubInMapping(channel string, mapping MemberMapping
 	}
 
 	// Overwrite the stub Node data with the new data
-	stub.RemoteNode.NodeAddress = node
+	stub.RemoteNode = node
 
 	// Put the stub into the mapping
 	mapping.Put(stub)
@@ -161,7 +162,7 @@ func (ac *AuthCommMgr) createRemoteContext(stub *Stub, channel string) func() (*
 	return func() (*RemoteContext, error) {
 		ac.Logger.Debugf("Connecting to node: %v for channel: %v", stub.RemoteNode.NodeAddress, channel)
 
-		conn, err := ac.Connections.Connect(stub.Endpoint)
+		conn, err := ac.Connections.Connect(stub.Endpoint, stub.RemoteNode.ServerRootCA)
 		if err != nil {
 			ac.Logger.Warningf("Unable to obtain connection to %d(%s) (channel %s): %v", stub.ID, stub.Endpoint, channel, err)
 			return nil, err
@@ -182,7 +183,12 @@ func (ac *AuthCommMgr) createRemoteContext(stub *Stub, channel string) func() (*
 				return nil, err
 			}
 			stepClientStream := &NodeClientStream{
-				StepClient: stream,
+				Version:           0,
+				StepClient:        stream,
+				SourceNodeID:      ac.NodeID,
+				DestinationNodeID: stub.ID,
+				Signer:            ac.Signer,
+				Channel:           channel,
 			}
 			return stepClientStream, nil
 		}
@@ -201,18 +207,19 @@ func (ac *AuthCommMgr) createRemoteContext(stub *Stub, channel string) func() (*
 			ProbeConn:           probeConnection,
 			conn:                conn,
 			GetStreamFunc:       getStepClientStream,
-			// Client:              clusterClient,
-			shutdownSignal:    ac.shutdownSignal,
-			SourceNodeID:      ac.NodeID,
-			DestinationNodeID: stub.ID,
-			Signer:            ac.Signer,
+			shutdownSignal:      ac.shutdownSignal,
 		}
 		return rc, nil
 	}
 }
 
 type NodeClientStream struct {
-	StepClient orderer.ClusterNodeService_StepClient
+	StepClient        orderer.ClusterNodeService_StepClient
+	Version           uint32
+	SourceNodeID      uint64
+	DestinationNodeID uint64
+	Signer            identity.Signer
+	Channel           string
 }
 
 func (cs *NodeClientStream) Send(request *orderer.StepRequest) error {
@@ -231,8 +238,8 @@ func (cs *NodeClientStream) Recv() (*orderer.StepResponse, error) {
 	return BuildStepRespone(nodeResponse)
 }
 
-func (cs *NodeClientStream) Auth(version uint32, fromId uint64, toId uint64, channel string, signer identity.Signer) error {
-	if signer == nil {
+func (cs *NodeClientStream) Auth() error {
+	if cs.Signer == nil {
 		return errors.New("signer is nil")
 	}
 
@@ -242,11 +249,11 @@ func (cs *NodeClientStream) Auth(version uint32, fromId uint64, toId uint64, cha
 	}
 
 	payload := &orderer.NodeAuthRequest{
-		Version:   version,
+		Version:   cs.Version,
 		Timestamp: timestamp,
-		FromId:    fromId,
-		ToId:      toId,
-		Channel:   channel,
+		FromId:    cs.SourceNodeID,
+		ToId:      cs.DestinationNodeID,
+		Channel:   cs.Channel,
 	}
 
 	bindingFieldsHash := GetSessionBindingHash(payload)
@@ -258,13 +265,14 @@ func (cs *NodeClientStream) Auth(version uint32, fromId uint64, toId uint64, cha
 	payload.SessionBinding = tlsBinding
 
 	asnSignFields, _ := asn1.Marshal(AuthRequestSignature{
-		Version:   int64(payload.Version),
-		Timestamp: payload.Timestamp.String(),
-		FromId:    strconv.FormatUint(payload.FromId, 10),
-		ToId:      strconv.FormatUint(payload.ToId, 10),
-		Channel:   payload.Channel,
+		Version:        int64(payload.Version),
+		Timestamp:      payload.Timestamp.String(),
+		FromId:         strconv.FormatUint(payload.FromId, 10),
+		ToId:           strconv.FormatUint(payload.ToId, 10),
+		SessionBinding: payload.SessionBinding,
+		Channel:        payload.Channel,
 	})
-	sig, err := signer.Sign(asnSignFields)
+	sig, err := cs.Signer.Sign(asnSignFields)
 	if err != nil {
 		return errors.Wrap(err, "signing failed")
 	}

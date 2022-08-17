@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/hyperledger/fabric/internal/pkg/comm"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
 
@@ -38,7 +39,10 @@ type ConnectionsMgr struct {
 	dialer      comm.ClientConfig
 }
 
-func (c *ConnectionsMgr) Connect(endpoint string) (*grpc.ClientConn, error) {
+func (c *ConnectionsMgr) Connect(endpoint string, serverRootCACert []byte) (*grpc.ClientConn, error) {
+	if serverRootCACert == nil {
+		return nil, errors.New("Server Root CA Cert is nil")
+	}
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -46,6 +50,8 @@ func (c *ConnectionsMgr) Connect(endpoint string) (*grpc.ClientConn, error) {
 	if alreadyConnected {
 		return conn, nil
 	}
+
+	c.dialer.SecOpts.ServerRootCAs = [][]byte{serverRootCACert}
 
 	conn, err := c.dialer.Dial(endpoint)
 	if err != nil {

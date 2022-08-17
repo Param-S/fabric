@@ -11,7 +11,6 @@ import (
 	"crypto/rand"
 	"fmt"
 	"net"
-	"runtime/debug"
 	"sync"
 	"testing"
 	"time"
@@ -31,7 +30,7 @@ import (
 )
 
 type clusterServiceNode struct {
-	nodeInfo     cluster.NodeAddress
+	nodeInfo     cluster.RemoteNode
 	bindAddress  string
 	server       *comm_utils.GRPCServer
 	cli          *cluster.AuthCommMgr
@@ -111,9 +110,14 @@ func newClusterServiceNode(t *testing.T, signer identity.Signer) *clusterService
 		server:  gRPCServer,
 		service: tstSrv,
 		cli:     cli,
-		nodeInfo: cluster.NodeAddress{
-			Endpoint: gRPCServer.Address(),
-			ID:       cli.NodeID,
+		nodeInfo: cluster.RemoteNode{
+			NodeAddress: cluster.NodeAddress{
+				Endpoint: gRPCServer.Address(),
+				ID:       cli.NodeID,
+			},
+			NodeCerts: cluster.NodeCerts{
+				ServerRootCA: ca.CertBytes(),
+			},
 		},
 		handler:      handler,
 		serverConfig: srvConfig,
@@ -126,6 +130,7 @@ func newClusterServiceNode(t *testing.T, signer identity.Signer) *clusterService
 func TestCommServiceBasicAuthentication(t *testing.T) {
 	// Scenario: Basic test that spawns 2 nodes and sends each other
 	// messages that are expected to be echoed back
+	t.Parallel()
 
 	clientKeyPair1, _ := ca.NewClientCertKeyPair()
 	node1 := newClusterServiceNode(t, &signingIdentity{clientKeyPair1.Signer})
@@ -137,7 +142,8 @@ func TestCommServiceBasicAuthentication(t *testing.T) {
 	defer node2.server.Stop()
 	defer node2.cli.Shutdown()
 
-	config := []cluster.NodeAddress{node1.nodeInfo, node2.nodeInfo}
+	config := []cluster.RemoteNode{node1.nodeInfo, node2.nodeInfo}
+
 	node1.cli.Configure(testChannel, config)
 	node2.cli.Configure(testChannel, config)
 
@@ -151,6 +157,7 @@ func TestCommServiceMultiChannelAuth(t *testing.T) {
 	// Scenario: node 1 knows node 2 only in channel "foo"
 	// and knows node 3 only in channel "bar".
 	// Messages that are received, are routed according to their corresponding channels
+	t.Parallel()
 
 	clientKeyPair1, _ := ca.NewClientCertKeyPair()
 	node1 := newClusterServiceNode(t, &signingIdentity{clientKeyPair1.Signer})
@@ -166,51 +173,43 @@ func TestCommServiceMultiChannelAuth(t *testing.T) {
 	defer node2.cli.Shutdown()
 	defer node3.cli.Shutdown()
 
-	node1.cli.Configure("foo", []cluster.NodeAddress{node2.nodeInfo})
-	node1.cli.Configure("bar", []cluster.NodeAddress{node3.nodeInfo})
-	node2.cli.Configure("foo", []cluster.NodeAddress{node1.nodeInfo})
-	node3.cli.Configure("bar", []cluster.NodeAddress{node1.nodeInfo})
+	node1.cli.Configure("foo", []cluster.RemoteNode{node2.nodeInfo})
+	node1.cli.Configure("bar", []cluster.RemoteNode{node3.nodeInfo})
+	node2.cli.Configure("foo", []cluster.RemoteNode{node1.nodeInfo})
+	node3.cli.Configure("bar", []cluster.RemoteNode{node1.nodeInfo})
 
-	t.Run("Correct channel", func(t *testing.T) {
-		var fromNode2 sync.WaitGroup
-		fromNode2.Add(1)
-		node1.handler.On("OnSubmit", "foo", node2.nodeInfo.ID, mock.Anything).Return(nil).Run(func(_ mock.Arguments) {
-			fromNode2.Done()
-		}).Once()
+	var fromNode2 sync.WaitGroup
+	fromNode2.Add(1)
+	node1.handler.On("OnSubmit", "foo", node2.nodeInfo.ID, mock.Anything).Return(nil).Run(func(_ mock.Arguments) {
+		fromNode2.Done()
+	}).Once()
 
-		var fromNode3 sync.WaitGroup
-		fromNode3.Add(1)
-		node1.handler.On("OnSubmit", "bar", node3.nodeInfo.ID, mock.Anything).Return(nil).Run(func(_ mock.Arguments) {
-			fromNode3.Done()
-		}).Once()
+	var fromNode3 sync.WaitGroup
+	fromNode3.Add(1)
+	node1.handler.On("OnSubmit", "bar", node3.nodeInfo.ID, mock.Anything).Return(nil).Run(func(_ mock.Arguments) {
+		fromNode3.Done()
+	}).Once()
 
-		node1.service.ConfigureNodeCerts("foo", []common.Consenter{{Id: uint32(node2.nodeInfo.ID), Identity: clientKeyPair2.Cert}})
-		node1.service.ConfigureNodeCerts("bar", []common.Consenter{{Id: uint32(node3.nodeInfo.ID), Identity: clientKeyPair3.Cert}})
+	node1.service.ConfigureNodeCerts("foo", []common.Consenter{{Id: uint32(node2.nodeInfo.ID), Identity: clientKeyPair2.Cert}})
+	node1.service.ConfigureNodeCerts("bar", []common.Consenter{{Id: uint32(node3.nodeInfo.ID), Identity: clientKeyPair3.Cert}})
 
-		node2toNode1, err := node2.cli.Remote("foo", node1.nodeInfo.ID)
-		require.NoError(t, err)
+	node2toNode1, err := node2.cli.Remote("foo", node1.nodeInfo.ID)
+	require.NoError(t, err)
 
-		node2toNode1.SourceNodeID = node2.nodeInfo.ID
-		node2toNode1.DestinationNodeID = node1.nodeInfo.ID
+	node3toNode1, err := node3.cli.Remote("bar", node1.nodeInfo.ID)
+	require.NoError(t, err)
 
-		node3toNode1, err := node3.cli.Remote("bar", node1.nodeInfo.ID)
-		require.NoError(t, err)
+	stream := assertEventualEstablishStreamWithSigner(t, node2toNode1)
+	stream.Send(fooReq)
 
-		node3toNode1.SourceNodeID = node3.nodeInfo.ID
-		node3toNode1.DestinationNodeID = node1.nodeInfo.ID
+	fromNode2.Wait()
+	node1.handler.AssertNumberOfCalls(t, "OnSubmit", 1)
 
-		stream := assertEventualEstablishStreamWithSigner(t, node2toNode1)
-		stream.Send(fooReq)
+	stream = assertEventualEstablishStreamWithSigner(t, node3toNode1)
+	stream.Send(barReq)
 
-		fromNode2.Wait()
-		node1.handler.AssertNumberOfCalls(t, "OnSubmit", 1)
-
-		stream = assertEventualEstablishStreamWithSigner(t, node3toNode1)
-		stream.Send(barReq)
-
-		fromNode3.Wait()
-		node1.handler.AssertNumberOfCalls(t, "OnSubmit", 2)
-	})
+	fromNode3.Wait()
+	node1.handler.AssertNumberOfCalls(t, "OnSubmit", 2)
 }
 
 func TestCommServiceMembershipReconfigurationAuth(t *testing.T) {
@@ -219,6 +218,7 @@ func TestCommServiceMembershipReconfigurationAuth(t *testing.T) {
 	// without node1 knowing about node 2.
 	// The communication between them should only work
 	// after node 1 is configured to know about node 2.
+	t.Parallel()
 
 	clientKeyPair1, _ := ca.NewClientCertKeyPair()
 	node1 := newClusterServiceNode(t, &signingIdentity{clientKeyPair1.Signer})
@@ -231,14 +231,20 @@ func TestCommServiceMembershipReconfigurationAuth(t *testing.T) {
 	defer node1.cli.Shutdown()
 	defer node2.cli.Shutdown()
 
-	node1.cli.Configure(testChannel, []cluster.NodeAddress{})
-	node2.cli.Configure(testChannel, []cluster.NodeAddress{node1.nodeInfo})
+	// node2 is not part of the node1's testChannel consenters set
+	node1.cli.Configure(testChannel, []cluster.RemoteNode{})
+	node1.service.ConfigureNodeCerts(testChannel, []common.Consenter{})
+
+	node2.cli.Configure(testChannel, []cluster.RemoteNode{node1.nodeInfo})
+	node2.service.ConfigureNodeCerts(testChannel, []common.Consenter{
+		{Id: uint32(node1.nodeInfo.ID), Identity: clientKeyPair1.Cert},
+	})
 
 	// Node 1 can't connect to node 2 because it doesn't know its TLS certificate yet
 	_, err := node1.cli.Remote(testChannel, node2.nodeInfo.ID)
 	require.EqualError(t, err, fmt.Sprintf("node %d doesn't exist in channel test's membership", node2.nodeInfo.ID))
 
-	// Node 2 can connect to node 1, but it can't send it messages because node 1 doesn't know node 2 yet.
+	// Node 2 can connect to node 1, but it can't send messages because node 1 doesn't know node 2 yet.
 	gt := gomega.NewGomegaWithT(t)
 	gt.Eventually(func() (bool, error) {
 		_, err := node2.cli.Remote(testChannel, node1.nodeInfo.ID)
@@ -248,12 +254,9 @@ func TestCommServiceMembershipReconfigurationAuth(t *testing.T) {
 	stub, err := node2.cli.Remote(testChannel, node1.nodeInfo.ID)
 	require.NoError(t, err)
 
-	node2.service.ConfigureNodeCerts(testChannel, []common.Consenter{
-		{Id: uint32(node1.nodeInfo.ID), Identity: clientKeyPair1.Cert},
-	})
-
-	node1.service.ConfigureNodeCerts(testChannel, []common.Consenter{})
-
+	// node2 is able to establish the connection with node1 and
+	// create the client stream but send failed during the authentication
+	// which is known to client stream when it calls recv
 	stream := assertEventualEstablishStreamWithSigner(t, stub)
 	err = stream.Send(wrapSubmitReq(testSubReq))
 	require.NoError(t, err)
@@ -262,8 +265,7 @@ func TestCommServiceMembershipReconfigurationAuth(t *testing.T) {
 	require.EqualError(t, err, "rpc error: code = Unauthenticated desc = access denied")
 
 	// Next, configure node 1 to know about node 2
-	node1.cli.Configure(testChannel, []cluster.NodeAddress{node2.nodeInfo})
-
+	node1.cli.Configure(testChannel, []cluster.RemoteNode{node2.nodeInfo})
 	node1.service.ConfigureNodeCerts(testChannel, []common.Consenter{
 		{Id: uint32(node2.nodeInfo.ID), Identity: clientKeyPair2.Cert},
 	})
@@ -272,17 +274,57 @@ func TestCommServiceMembershipReconfigurationAuth(t *testing.T) {
 	assertBiDiCommunicationForChannelWithSigner(t, node1, node2, testReq, testChannel)
 
 	// Reconfigure node 2 to forget about node 1
-	node2.cli.Configure(testChannel, []cluster.NodeAddress{})
+	node2.cli.Configure(testChannel, []cluster.RemoteNode{})
+	node2.service.ConfigureNodeCerts(testChannel, []common.Consenter{})
+
 	// Node 1 can still connect to node 2
 	stub, err = node1.cli.Remote(testChannel, node2.nodeInfo.ID)
 	require.NoError(t, err)
 
-	node2.service.ConfigureNodeCerts(testChannel, []common.Consenter{})
 	// But can't send a message because node 2 now doesn't authorized node 1
 	stream = assertEventualEstablishStreamWithSigner(t, stub)
 	stream.Send(wrapSubmitReq(testSubReq))
+	require.NoError(t, err)
+
 	_, err = stream.Recv()
 	require.EqualError(t, err, "rpc error: code = Unauthenticated desc = access denied")
+
+	// Reconfigure node 2 to know about node 1
+	node2.cli.Configure(testChannel, []cluster.RemoteNode{node1.nodeInfo})
+	node2.service.ConfigureNodeCerts(testChannel, []common.Consenter{
+		{Id: uint32(node1.nodeInfo.ID), Identity: clientKeyPair1.Cert},
+	})
+
+	// Node 1 can still connect to node 2
+	stub, err = node1.cli.Remote(testChannel, node2.nodeInfo.ID)
+	require.NoError(t, err)
+
+	// node 1 can now send a message to node 2 now
+	stream = assertEventualEstablishStreamWithSigner(t, stub)
+
+	stream.Send(wrapSubmitReq(testSubReq))
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	node2.handler.On("OnSubmit", testChannel, node1.nodeInfo.ID, mock.Anything).Return(nil).Once().Run(func(args mock.Arguments) {
+		wg.Done()
+	})
+
+	wg.Wait()
+
+	// Reconfigure the node 2 consenters set while the stream is active
+	// this will result into stale stream
+	node2.service.ConfigureNodeCerts(testChannel, []common.Consenter{
+		{Id: uint32(node1.nodeInfo.ID), Identity: clientKeyPair1.Cert},
+	})
+
+	err = stream.Send(wrapSubmitReq(testSubReq))
+	require.NoError(t, err)
+
+	_, err = stream.Recv()
+	require.EqualError(t, err, "rpc error: code = Unknown desc = stream is stale")
 }
 
 func TestCommServiceReconnectAuth(t *testing.T) {
@@ -292,6 +334,7 @@ func TestCommServiceReconnectAuth(t *testing.T) {
 	// and afterwards node 2 is brought back, after which
 	// node 1 sends more messages, and it should succeed
 	// sending a message to node 2 eventually.
+	t.Parallel()
 
 	clientKeyPair1, _ := ca.NewClientCertKeyPair()
 	node1 := newClusterServiceNode(t, &signingIdentity{clientKeyPair1.Signer})
@@ -304,12 +347,9 @@ func TestCommServiceReconnectAuth(t *testing.T) {
 	defer node1.cli.Shutdown()
 	defer node2.cli.Shutdown()
 
-	// conf := node1.dialer.Config
-	// conf.DialTimeout = time.Hour
-
 	node2.handler.On("OnSubmit", testChannel, node1.nodeInfo.ID, mock.Anything).Return(nil)
 
-	config := []cluster.NodeAddress{node1.nodeInfo, node2.nodeInfo}
+	config := []cluster.RemoteNode{node1.nodeInfo, node2.nodeInfo}
 	node1.cli.Configure(testChannel, config)
 	node2.cli.Configure(testChannel, config)
 
@@ -341,6 +381,63 @@ func TestCommServiceReconnectAuth(t *testing.T) {
 	// Send a message from node 1 to node 2.
 	// Should succeed eventually
 	assertEventualSendMessageWithSigner(t, stub, testReq)
+}
+
+func TestBuildStepRespone(t *testing.T) {
+	t.Parallel()
+	tcs := []struct {
+		name  string
+		input *orderer.ClusterNodeServiceStepResponse
+		res   *orderer.StepResponse
+		err   string
+	}{
+		{
+			name:  "input is nil",
+			input: nil,
+			res:   nil,
+			err:   "input response object is nil",
+		},
+		{
+			name: "complete node step response",
+			input: &orderer.ClusterNodeServiceStepResponse{
+				Payload: &orderer.ClusterNodeServiceStepResponse_TranorderRes{
+					TranorderRes: &orderer.TransactionOrderResponse{
+						Channel: "test",
+						Status:  common.Status_SUCCESS,
+					},
+				},
+			},
+			res: &orderer.StepResponse{
+				Payload: &orderer.StepResponse_SubmitRes{
+					SubmitRes: &orderer.SubmitResponse{
+						Channel: "test",
+						Status:  common.Status_SUCCESS,
+					},
+				},
+			},
+			err: "",
+		},
+		{
+			name: "input invalid object",
+			input: &orderer.ClusterNodeServiceStepResponse{
+				Payload: nil,
+			},
+			res: nil,
+			err: "service stream returned with invalid response type",
+		},
+	}
+	for _, tc := range tcs {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			res, err := cluster.BuildStepRespone(tc.input)
+			if err != nil {
+				require.EqualError(t, err, tc.err)
+			} else {
+				require.EqualValues(t, tc.res, res)
+			}
+		})
+	}
 }
 
 func assertEventualSendMessageWithSigner(t *testing.T, rpc *cluster.RemoteContext, req *orderer.SubmitRequest) *cluster.Stream {
@@ -392,7 +489,6 @@ func assertBiDiCommunicationForChannelWithSigner(t *testing.T, node1, node2 *clu
 			require.True(t, proto.Equal(req, msgToSend))
 			t.Log(estab.label)
 			wg.Done()
-			debug.PrintStack()
 		})
 
 		err = stream.Send(wrapSubmitReq(msgToSend))

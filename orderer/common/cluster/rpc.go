@@ -14,7 +14,6 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/pkg/errors"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
@@ -46,8 +45,6 @@ type RPC struct {
 	Comm          Communicator
 	lock          sync.RWMutex
 	StreamsByType map[OperationType]map[uint64]*Stream
-	SourceNodeID  uint64
-	Signer        identity.SignerSerializer
 }
 
 // NewStreamsByType returns a mapping of operation type to
