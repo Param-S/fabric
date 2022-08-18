@@ -302,29 +302,45 @@ func TestCommServiceMembershipReconfigurationAuth(t *testing.T) {
 	// node 1 can now send a message to node 2 now
 	stream = assertEventualEstablishStreamWithSigner(t, stub)
 
-	stream.Send(wrapSubmitReq(testSubReq))
-	require.NoError(t, err)
-
 	var wg sync.WaitGroup
 	wg.Add(1)
-
 	node2.handler.On("OnSubmit", testChannel, node1.nodeInfo.ID, mock.Anything).Return(nil).Once().Run(func(args mock.Arguments) {
 		wg.Done()
 	})
 
+	stream.Send(wrapSubmitReq(testSubReq))
+	require.NoError(t, err)
+
 	wg.Wait()
 
 	// Reconfigure the node 2 consenters set while the stream is active
-	// this will result into stale stream
+	// stream should not be affected as the node 1 still part of the consenter set
 	node2.service.ConfigureNodeCerts(testChannel, []common.Consenter{
 		{Id: uint32(node1.nodeInfo.ID), Identity: clientKeyPair1.Cert},
+		{Id: uint32(node2.nodeInfo.ID), Identity: clientKeyPair2.Cert},
+	})
+
+	wg.Add(1)
+	node2.handler.On("OnSubmit", testChannel, node1.nodeInfo.ID, mock.Anything).Return(nil).Once().Run(func(args mock.Arguments) {
+		wg.Done()
+	})
+
+	err = stream.Send(wrapSubmitReq(testSubReq))
+	require.NoError(t, err)
+
+	wg.Wait()
+
+	// Reconfigure the node 2 consenters set removing the node1
+	// now the stream marked as stale
+	node2.service.ConfigureNodeCerts(testChannel, []common.Consenter{
+		{Id: uint32(node2.nodeInfo.ID), Identity: clientKeyPair2.Cert},
 	})
 
 	err = stream.Send(wrapSubmitReq(testSubReq))
 	require.NoError(t, err)
 
 	_, err = stream.Recv()
-	require.EqualError(t, err, "rpc error: code = Unknown desc = stream is stale")
+	require.EqualError(t, err, "rpc error: code = Unknown desc = stream 2 is stale")
 }
 
 func TestCommServiceReconnectAuth(t *testing.T) {

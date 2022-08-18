@@ -38,8 +38,9 @@ type ClusterStepStream interface {
 }
 
 type ChannelMembersConfig struct {
-	LastUpdatedTime int64
-	MemberMapping   map[uint64][]byte
+	MemberMapping     map[uint64][]byte
+	AuthorizedStreams sync.Map // Stream ID --> node identifier
+	nextStreamID      uint64
 }
 
 // ClusterService implements the server API for ClusterNodeService service
@@ -72,7 +73,6 @@ func (s *ClusterService) Step(stream orderer.ClusterNodeService_StepServer) erro
 	commonName := commonNameFromContext(stream.Context())
 	exp := s.initializeExpirationCheck(stream, addr, commonName)
 	s.Logger.Debugf("Connection from %s(%s)", commonName, addr)
-	defer s.Logger.Debugf("Closing connection from %s(%s)", commonName, addr)
 
 	// On a new stream, auth request is the first msg
 	request, err := stream.Recv()
@@ -85,14 +85,22 @@ func (s *ClusterService) Step(stream orderer.ClusterNodeService_StepServer) erro
 		return err
 	}
 
-	authReq, configUpdatedTime, err := s.VerifyAuthRequest(stream, request)
+	s.Lock.RLock()
+	authReq, err := s.VerifyAuthRequest(stream, request)
 	if err != nil {
-		s.Logger.Warnf("service authentication failed with error: %v", err)
+		s.Lock.RUnlock()
+		s.Logger.Warnf("service authentication of %s failed with error: %v", addr, err)
 		return status.Errorf(codes.Unauthenticated, "access denied")
 	}
 
+	defer s.Logger.Debugf("Closing connection from %s(%s)", commonName, addr)
+
+	streamID := atomic.AddUint64(&s.MembershipByChannel[authReq.Channel].nextStreamID, 1)
+	s.MembershipByChannel[authReq.Channel].AuthorizedStreams.Store(streamID, authReq.FromId)
+	s.Lock.RUnlock()
+
 	for {
-		err := s.handleMessage(stream, addr, exp, authReq.Channel, authReq.FromId, configUpdatedTime)
+		err := s.handleMessage(stream, addr, exp, authReq.Channel, authReq.FromId, streamID)
 		if err == io.EOF {
 			s.Logger.Debugf("%s(%s) disconnected", commonName, addr)
 			return nil
@@ -104,21 +112,21 @@ func (s *ClusterService) Step(stream orderer.ClusterNodeService_StepServer) erro
 	}
 }
 
-func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_StepServer, request *orderer.ClusterNodeServiceStepRequest) (*orderer.NodeAuthRequest, int64, error) {
+func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_StepServer, request *orderer.ClusterNodeServiceStepRequest) (*orderer.NodeAuthRequest, error) {
 	authReq := request.GetNodeAuthrequest()
 	if authReq == nil {
-		return nil, -1, errors.New("invalid request object")
+		return nil, errors.New("invalid request object")
 	}
 
 	bindingFieldsHash := GetSessionBindingHash(authReq)
 
 	tlsBinding, err := GetTLSSessionBinding(stream.Context(), bindingFieldsHash)
 	if err != nil {
-		return nil, -1, errors.Wrap(err, "session binding read failed")
+		return nil, errors.Wrap(err, "session binding read failed")
 	}
 
 	if !bytes.Equal(tlsBinding, authReq.SessionBinding) {
-		return nil, -1, errors.New("session binding mismatch")
+		return nil, errors.New("session binding mismatch")
 	}
 
 	msg, err := asn1.Marshal(AuthRequestSignature{
@@ -130,30 +138,28 @@ func (s *ClusterService) VerifyAuthRequest(stream orderer.ClusterNodeService_Ste
 		Channel:        authReq.Channel,
 	})
 	if err != nil {
-		return nil, -1, errors.Wrap(err, "ASN encoding failed")
+		return nil, errors.Wrap(err, "ASN encoding failed")
 	}
 
-	s.Lock.RLock()
-	defer s.Lock.RUnlock()
 	membership := s.MembershipByChannel[authReq.Channel]
 	if membership == nil {
-		return nil, -1, errors.Errorf("channel %s not found in config", authReq.Channel)
+		return nil, errors.Errorf("channel %s not found in config", authReq.Channel)
 	}
 
 	identity := membership.MemberMapping[authReq.FromId]
 	if identity == nil {
-		return nil, -1, errors.Errorf("node %d is not member of channel %s", authReq.FromId, authReq.Channel)
+		return nil, errors.Errorf("node %d is not member of channel %s", authReq.FromId, authReq.Channel)
 	}
 
 	err = VerifySignature(identity, msg, authReq.Signature)
 	if err != nil {
-		return nil, -1, errors.Wrap(err, "signature mismatch")
+		return nil, errors.Wrap(err, "signature mismatch")
 	}
 
-	return authReq, atomic.LoadInt64(&s.MembershipByChannel[authReq.Channel].LastUpdatedTime), nil
+	return authReq, nil
 }
 
-func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, exp *certificateExpirationCheck, channel string, sender uint64, streamRefTime int64) error {
+func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, exp *certificateExpirationCheck, channel string, sender uint64, streamID uint64) error {
 	request, err := stream.Recv()
 	if err == io.EOF {
 		return err
@@ -163,12 +169,15 @@ func (s *ClusterService) handleMessage(stream ClusterStepStream, addr string, ex
 		return err
 	}
 	if request == nil {
-		return errors.Errorf("Request message is nil")
+		return errors.Errorf("request message is nil")
 	}
 
-	if streamRefTime != atomic.LoadInt64(&s.MembershipByChannel[channel].LastUpdatedTime) {
-		s.Logger.Debugf("Channel %s stream is stale", channel)
-		return errors.New("stream is stale")
+	s.Lock.RLock()
+	_, authorized := s.MembershipByChannel[channel].AuthorizedStreams.Load(streamID)
+	s.Lock.RUnlock()
+
+	if !authorized {
+		return errors.Errorf("stream %d is stale", streamID)
 	}
 
 	if s.StepLogger.IsEnabledFor(zap.DebugLevel) {
@@ -216,27 +225,35 @@ func (s *ClusterService) initializeExpirationCheck(stream orderer.ClusterNodeSer
 }
 
 func (c *ClusterService) ConfigureNodeCerts(channel string, newNodes []common.Consenter) error {
+	c.Lock.Lock()
+	defer c.Lock.Unlock()
+
 	if c.MembershipByChannel == nil {
-		return errors.New("Nodes cert storage is not initialized")
+		c.MembershipByChannel = make(map[string]*ChannelMembersConfig)
 	}
 
 	c.Logger.Infof("Updating nodes identity, channel: %s, nodes: %v", channel, newNodes)
 
-	c.Lock.Lock()
-	defer c.Lock.Unlock()
+	channelMembership, exists := c.MembershipByChannel[channel]
+	if !exists {
+		channelMembership = &ChannelMembersConfig{}
+		c.MembershipByChannel[channel] = channelMembership
+	}
 
-	channelCert := c.MembershipByChannel[channel]
-	if channelCert != nil {
-		c.Logger.Debugf("Refreshing the %s channel nodes identities", channel)
-		delete(c.MembershipByChannel, channel)
-	}
-	channelCert = &ChannelMembersConfig{}
-	atomic.StoreInt64(&channelCert.LastUpdatedTime, time.Now().UnixNano())
-	channelCert.MemberMapping = make(map[uint64][]byte)
+	channelMembership.MemberMapping = make(map[uint64][]byte)
+
 	for _, nodeIdentity := range newNodes {
-		channelCert.MemberMapping[uint64(nodeIdentity.Id)] = nodeIdentity.Identity
+		channelMembership.MemberMapping[uint64(nodeIdentity.Id)] = nodeIdentity.Identity
 	}
-	c.MembershipByChannel[channel] = channelCert
+
+	// Iterate over existing streams and prune those that should not be there anymore
+	channelMembership.AuthorizedStreams.Range(func(streamID, nodeID interface{}) bool {
+		if _, exists := channelMembership.MemberMapping[nodeID.(uint64)]; !exists {
+			channelMembership.AuthorizedStreams.Delete(streamID.(uint64))
+		}
+		return true
+	})
+
 	return nil
 }
 

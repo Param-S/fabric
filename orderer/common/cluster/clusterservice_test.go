@@ -36,11 +36,14 @@ import (
 )
 
 var (
-	tstamp, _       = ptypes.TimestampProto(time.Now().UTC())
-	nodeAuthRequest = orderer.NodeAuthRequest{
+	sourceNodeID      uint64 = 1
+	destinationNodeID uint64 = 2
+	streamID          uint64 = 111
+	tstamp, _                = ptypes.TimestampProto(time.Now().UTC())
+	nodeAuthRequest          = orderer.NodeAuthRequest{
 		Version:   0,
-		FromId:    1,
-		ToId:      2,
+		FromId:    sourceNodeID,
+		ToId:      destinationNodeID,
 		Channel:   "mychannel",
 		Timestamp: tstamp,
 	}
@@ -338,7 +341,7 @@ func TestClusterServiceVerifyAuthRequest(t *testing.T) {
 			},
 		}
 		svc.ConfigureNodeCerts(authRequest.Channel, []common.Consenter{{Id: uint32(authRequest.FromId), Identity: clientKeyPair1.Cert}})
-		_, _, err = svc.VerifyAuthRequest(stream, stepRequest)
+		_, err = svc.VerifyAuthRequest(stream, stepRequest)
 		require.NoError(t, err)
 	})
 
@@ -365,7 +368,7 @@ func TestClusterServiceVerifyAuthRequest(t *testing.T) {
 				NodeAuthrequest: &authRequest,
 			},
 		}
-		_, _, err := svc.VerifyAuthRequest(stream, stepRequest)
+		_, err := svc.VerifyAuthRequest(stream, stepRequest)
 
 		require.EqualError(t, err, "session binding read failed: failed extracting stream context")
 	})
@@ -410,7 +413,7 @@ func TestClusterServiceVerifyAuthRequest(t *testing.T) {
 		authRequest.Signature = sig
 		svc.ConfigureNodeCerts(authRequest.Channel, []common.Consenter{{Id: uint32(authRequest.FromId), Identity: clientKeyPair1.Cert}})
 
-		_, _, err = svc.VerifyAuthRequest(stream, stepRequest)
+		_, err = svc.VerifyAuthRequest(stream, stepRequest)
 		require.EqualError(t, err, "session binding mismatch")
 	})
 
@@ -456,7 +459,7 @@ func TestClusterServiceVerifyAuthRequest(t *testing.T) {
 
 		delete(svc.MembershipByChannel, authRequest.Channel)
 
-		_, _, err = svc.VerifyAuthRequest(stream, stepRequest)
+		_, err = svc.VerifyAuthRequest(stream, stepRequest)
 		require.EqualError(t, err, "channel mychannel not found in config")
 	})
 
@@ -503,7 +506,7 @@ func TestClusterServiceVerifyAuthRequest(t *testing.T) {
 		delete(svc.MembershipByChannel, authRequest.Channel)
 		svc.ConfigureNodeCerts(authRequest.Channel, []common.Consenter{{Id: uint32(authRequest.ToId), Identity: clientKeyPair1.Cert}})
 
-		_, _, err = svc.VerifyAuthRequest(stream, stepRequest)
+		_, err = svc.VerifyAuthRequest(stream, stepRequest)
 		require.EqualError(t, err, "node 1 is not member of channel mychannel")
 	})
 
@@ -550,7 +553,7 @@ func TestClusterServiceVerifyAuthRequest(t *testing.T) {
 
 		clientKeyPair2, _ := ca.NewClientCertKeyPair()
 		svc.ConfigureNodeCerts(authRequest.Channel, []common.Consenter{{Id: uint32(authRequest.FromId), Identity: clientKeyPair2.Cert}})
-		_, _, err = svc.VerifyAuthRequest(stream, stepRequest)
+		_, err = svc.VerifyAuthRequest(stream, stepRequest)
 		require.EqualError(t, err, "signature mismatch: signature invalid")
 	})
 }
@@ -558,18 +561,11 @@ func TestClusterServiceVerifyAuthRequest(t *testing.T) {
 func TestConfigureNodeCerts(t *testing.T) {
 	t.Parallel()
 	authRequest := nodeAuthRequest
-	t.Run("Throws error when storage not initialized", func(t *testing.T) {
-		t.Parallel()
-		svc := &cluster.ClusterService{}
-		err := svc.ConfigureNodeCerts("mychannel", nil)
-		require.EqualError(t, err, "Nodes cert storage is not initialized")
-	})
 
 	t.Run("Creates new entry when input channel not part of the members list", func(t *testing.T) {
 		t.Parallel()
 		svc := &cluster.ClusterService{}
 		svc.Logger = flogging.MustGetLogger("test")
-		svc.MembershipByChannel = make(map[string]*cluster.ChannelMembersConfig)
 
 		clientKeyPair1, _ := ca.NewClientCertKeyPair()
 		err := svc.ConfigureNodeCerts("mychannel", []common.Consenter{{Id: uint32(authRequest.FromId), Identity: clientKeyPair1.Cert}})
@@ -581,7 +577,6 @@ func TestConfigureNodeCerts(t *testing.T) {
 		t.Parallel()
 		svc := &cluster.ClusterService{}
 		svc.Logger = flogging.MustGetLogger("test")
-		svc.MembershipByChannel = make(map[string]*cluster.ChannelMembersConfig)
 
 		clientKeyPair1, _ := ca.NewClientCertKeyPair()
 		err := svc.ConfigureNodeCerts("mychannel", []common.Consenter{{Id: uint32(authRequest.FromId), Identity: clientKeyPair1.Cert}})
