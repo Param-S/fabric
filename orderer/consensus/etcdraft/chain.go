@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/pem"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,7 +45,7 @@ const (
 	// DefaultSnapshotCatchUpEntries is the default number of entries
 	// to preserve in memory when a snapshot is taken. This is for
 	// slow followers to catch up.
-	DefaultSnapshotCatchUpEntries = uint64(4)
+	DefaultSnapshotCatchUpEntries = uint64(1)
 
 	// DefaultSnapshotIntervalSize is the default snapshot interval. It is
 	// used if SnapshotIntervalSize is not provided in channel config options.
@@ -956,6 +957,8 @@ func (c *Chain) catchUp(snap *raftpb.Snapshot) error {
 	if err != nil {
 		return errors.Errorf("failed to unmarshal snapshot data to block: %s", err)
 	}
+
+	debug.PrintStack()
 
 	if c.lastBlock.Header.Number >= b.Header.Number {
 		c.logger.Warnf("Snapshot is at block [%d], local block number is %d, no sync needed", b.Header.Number, c.lastBlock.Header.Number)

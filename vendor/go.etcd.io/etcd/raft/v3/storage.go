@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"runtime/debug"
 	"sync"
 
 	pb "go.etcd.io/etcd/raft/v3/raftpb"
@@ -100,6 +101,7 @@ func (ms *MemoryStorage) InitialState() (pb.HardState, pb.ConfState, error) {
 
 // SetHardState saves the current HardState.
 func (ms *MemoryStorage) SetHardState(st pb.HardState) error {
+	debug.PrintStack()
 	ms.Lock()
 	defer ms.Unlock()
 	ms.hardState = st
@@ -172,6 +174,7 @@ func (ms *MemoryStorage) Snapshot() (pb.Snapshot, error) {
 // ApplySnapshot overwrites the contents of this Storage object with
 // those of the given snapshot.
 func (ms *MemoryStorage) ApplySnapshot(snap pb.Snapshot) error {
+	debug.PrintStack()
 	ms.Lock()
 	defer ms.Unlock()
 

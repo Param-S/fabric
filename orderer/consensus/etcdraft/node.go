@@ -9,6 +9,7 @@ package etcdraft
 import (
 	"context"
 	"crypto/sha256"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,6 +90,7 @@ func (n *node) run(campaign bool) {
 	raftTicker := n.clock.NewTicker(n.tickInterval)
 
 	if s := n.storage.Snapshot(); !raft.IsEmptySnap(s) {
+		debug.PrintStack()
 		n.chain.snapC <- &s
 	}
 
@@ -144,6 +146,7 @@ func (n *node) run(campaign bool) {
 			}
 
 			if !raft.IsEmptySnap(rd.Snapshot) {
+				debug.PrintStack()
 				n.chain.snapC <- &rd.Snapshot
 			}
 

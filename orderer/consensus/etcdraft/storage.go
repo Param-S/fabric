@@ -246,6 +246,7 @@ func (rs *RaftStorage) Store(entries []raftpb.Entry, hardstate raftpb.HardState,
 	}
 
 	if !raft.IsEmptySnap(snapshot) {
+		rs.lg.Infof("debug_added_by_param: hardstate: %v\nentries: %v \nsnapshot: %v", hardstate, entries, snapshot)
 		if err := rs.saveSnap(snapshot); err != nil {
 			return err
 		}

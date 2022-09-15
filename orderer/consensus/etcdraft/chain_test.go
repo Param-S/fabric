@@ -13,6 +13,9 @@ import (
 	"os"
 	"os/user"
 	"path"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,8 +41,10 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/types"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/client/pkg/v3/fileutil"
 	raft "go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/etcd/server/v3/wal"
 	"go.uber.org/zap"
 )
 
@@ -96,6 +101,27 @@ func skipIfRoot() {
 	if u.Uid == "0" {
 		Skip("you are running test as root, there's no way to make files unreadable")
 	}
+}
+
+func fileCount(files []string, suffix string) (c int) {
+	for _, f := range files {
+		if strings.HasSuffix(f, suffix) {
+			c++
+		}
+	}
+	return
+}
+
+func assertFileCount(walDir, snapDir string, wal, snap int) {
+	files, err := fileutil.ReadDir(walDir)
+	Expect(err).NotTo(HaveOccurred())
+	walFilesCount := fileCount(files, ".wal")
+	Expect(wal).To(Equal(walFilesCount))
+
+	files, err = fileutil.ReadDir(snapDir)
+	Expect(err).NotTo(HaveOccurred())
+	snapFilesCount := fileCount(files, ".snap")
+	Expect(snap).To(Equal(snapFilesCount))
 }
 
 var _ = Describe("Chain", func() {
@@ -211,34 +237,6 @@ var _ = Describe("Chain", func() {
 			}, LongEventualTimeout).Should(Receive(StateEqual(1, raft.StateLeader)))
 		}
 
-		JustBeforeEach(func() {
-			rpc := &mocks.FakeRPC{}
-			chain, err = etcdraft.NewChain(support, opts, configurator, rpc, cryptoProvider, noOpBlockPuller, fakeHaltCallbacker.HaltCallback, observeC)
-			Expect(err).NotTo(HaveOccurred())
-
-			chain.Start()
-			cRel, status := chain.StatusReport()
-			Expect(cRel).To(Equal(orderer_types.ConsensusRelationConsenter))
-			Expect(status).To(Equal(orderer_types.StatusActive))
-
-			// When the Raft node bootstraps, it produces a ConfChange
-			// to add itself, which needs to be consumed with Ready().
-			// If there are pending configuration changes in raft,
-			// it refuses to campaign, no matter how many ticks elapse.
-			// This is not a problem in the production code because raft.Ready
-			// will be consumed eventually, as the wall clock advances.
-			//
-			// However, this is problematic when using the fake clock and
-			// artificial ticks. Instead of ticking raft indefinitely until
-			// raft.Ready is consumed, this check is added to indirectly guarantee
-			// that the first ConfChange is actually consumed and we can safely
-			// proceed to tick the Raft FSM.
-			Eventually(func() error {
-				_, err := storage.Entries(1, 1, 1)
-				return err
-			}, LongEventualTimeout).ShouldNot(HaveOccurred())
-		})
-
 		AfterEach(func() {
 			chain.Halt()
 			Eventually(chain.Errored, LongEventualTimeout).Should(BeClosed())
@@ -247,7 +245,83 @@ var _ = Describe("Chain", func() {
 			os.RemoveAll(dataDir)
 		})
 
+		//debug_added_by_Param
+		Context("when node WAL is corrupted", func() {
+			It("chain start failing with error", func() {
+				ram := raft.NewMemoryStorage()
+				store, err := etcdraft.CreateStorage(logger, walDir, snapDir, ram)
+				Expect(err).NotTo(HaveOccurred())
+
+				// set SegmentSizeBytes to a small value so that
+				// every entry persisted to wal would result in
+				// a new wal being created.
+				oldSegmentSizeBytes := wal.SegmentSizeBytes
+				wal.SegmentSizeBytes = 10
+				defer func() {
+					wal.SegmentSizeBytes = oldSegmentSizeBytes
+				}()
+
+				// create 5 new entry
+				for i := 0; i < 5; i++ {
+					store.Store(
+						[]raftpb.Entry{{Index: uint64(i), Data: make([]byte, 100)}},
+						raftpb.HardState{Commit: uint64(i)},
+						raftpb.Snapshot{},
+					)
+				}
+				assertFileCount(walDir, snapDir, 6, 0)
+
+				// commit := 10
+				store.Store(
+					[]raftpb.Entry{},
+					raftpb.HardState{Commit: uint64(15)},
+					raftpb.Snapshot{
+						/* 						Metadata: raftpb.SnapshotMetadata{
+						   							Index: uint64(6),
+						   						},
+						   						Data: make([]byte, 100), */
+					},
+				)
+				err = store.Close()
+				Expect(err).NotTo(HaveOccurred())
+
+				rpc := &mocks.FakeRPC{}
+				chain, err = etcdraft.NewChain(support, opts, configurator, rpc, cryptoProvider, noOpBlockPuller, fakeHaltCallbacker.HaltCallback, observeC)
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(chain.Start).To(Panic())
+			})
+		})
+
 		Context("when a node starts up", func() {
+			JustBeforeEach(func() {
+				rpc := &mocks.FakeRPC{}
+				chain, err = etcdraft.NewChain(support, opts, configurator, rpc, cryptoProvider, noOpBlockPuller, fakeHaltCallbacker.HaltCallback, observeC)
+				Expect(err).NotTo(HaveOccurred())
+
+				chain.Start()
+				cRel, status := chain.StatusReport()
+				Expect(cRel).To(Equal(orderer_types.ConsensusRelationConsenter))
+				Expect(status).To(Equal(orderer_types.StatusActive))
+
+				// When the Raft node bootstraps, it produces a ConfChange
+				// to add itself, which needs to be consumed with Ready().
+				// If there are pending configuration changes in raft,
+				// it refuses to campaign, no matter how many ticks elapse.
+				// This is not a problem in the production code because raft.Ready
+				// will be consumed eventually, as the wall clock advances.
+				//
+				// However, this is problematic when using the fake clock and
+				// artificial ticks. Instead of ticking raft indefinitely until
+				// raft.Ready is consumed, this check is added to indirectly guarantee
+				// that the first ConfChange is actually consumed and we can safely
+				// proceed to tick the Raft FSM.
+				Eventually(func() error {
+					_, err := storage.Entries(1, 1, 1)
+					return err
+				}, LongEventualTimeout).ShouldNot(HaveOccurred())
+			})
+
 			It("properly configures the communication layer", func() {
 				expectedNodeConfig := nodeConfigFromMetadata(consenterMetadata)
 				Eventually(configurator.ConfigureCallCount, LongEventualTimeout).Should(Equal(1))
@@ -289,6 +363,34 @@ var _ = Describe("Chain", func() {
 		})
 
 		Context("when no Raft leader is elected", func() {
+			JustBeforeEach(func() {
+				rpc := &mocks.FakeRPC{}
+				chain, err = etcdraft.NewChain(support, opts, configurator, rpc, cryptoProvider, noOpBlockPuller, fakeHaltCallbacker.HaltCallback, observeC)
+				Expect(err).NotTo(HaveOccurred())
+
+				chain.Start()
+				cRel, status := chain.StatusReport()
+				Expect(cRel).To(Equal(orderer_types.ConsensusRelationConsenter))
+				Expect(status).To(Equal(orderer_types.StatusActive))
+
+				// When the Raft node bootstraps, it produces a ConfChange
+				// to add itself, which needs to be consumed with Ready().
+				// If there are pending configuration changes in raft,
+				// it refuses to campaign, no matter how many ticks elapse.
+				// This is not a problem in the production code because raft.Ready
+				// will be consumed eventually, as the wall clock advances.
+				//
+				// However, this is problematic when using the fake clock and
+				// artificial ticks. Instead of ticking raft indefinitely until
+				// raft.Ready is consumed, this check is added to indirectly guarantee
+				// that the first ConfChange is actually consumed and we can safely
+				// proceed to tick the Raft FSM.
+				Eventually(func() error {
+					_, err := storage.Entries(1, 1, 1)
+					return err
+				}, LongEventualTimeout).ShouldNot(HaveOccurred())
+			})
+
 			It("fails to order envelope", func() {
 				err := chain.Order(env, 0)
 				Expect(err).To(MatchError("no Raft leader"))
@@ -312,6 +414,31 @@ var _ = Describe("Chain", func() {
 
 		Context("when Raft leader is elected", func() {
 			JustBeforeEach(func() {
+				rpc := &mocks.FakeRPC{}
+				chain, err = etcdraft.NewChain(support, opts, configurator, rpc, cryptoProvider, noOpBlockPuller, fakeHaltCallbacker.HaltCallback, observeC)
+				Expect(err).NotTo(HaveOccurred())
+
+				chain.Start()
+				cRel, status := chain.StatusReport()
+				Expect(cRel).To(Equal(orderer_types.ConsensusRelationConsenter))
+				Expect(status).To(Equal(orderer_types.StatusActive))
+
+				// When the Raft node bootstraps, it produces a ConfChange
+				// to add itself, which needs to be consumed with Ready().
+				// If there are pending configuration changes in raft,
+				// it refuses to campaign, no matter how many ticks elapse.
+				// This is not a problem in the production code because raft.Ready
+				// will be consumed eventually, as the wall clock advances.
+				//
+				// However, this is problematic when using the fake clock and
+				// artificial ticks. Instead of ticking raft indefinitely until
+				// raft.Ready is consumed, this check is added to indirectly guarantee
+				// that the first ConfChange is actually consumed and we can safely
+				// proceed to tick the Raft FSM.
+				Eventually(func() error {
+					_, err := storage.Entries(1, 1, 1)
+					return err
+				}, LongEventualTimeout).ShouldNot(HaveOccurred())
 				campaign(chain, observeC)
 			})
 
@@ -845,7 +972,7 @@ var _ = Describe("Chain", func() {
 					}
 
 					BeforeEach(func() {
-						opts.SnapshotCatchUpEntries = 2
+						opts.SnapshotCatchUpEntries = 1
 
 						close(cutter.Block)
 						cutter.CutNext = true
@@ -1007,8 +1134,10 @@ var _ = Describe("Chain", func() {
 							Eventually(countFiles, LongEventualTimeout).Should(Equal(1))
 							Eventually(opts.MemoryStorage.FirstIndex, LongEventualTimeout).Should(BeNumerically(">", 1))
 							snapshot, err := opts.MemoryStorage.Snapshot() // get the snapshot just created
+							fmt.Printf("debug_added_by_Param: snapshot: %v\n", snapshot)
 							Expect(err).NotTo(HaveOccurred())
 							i, err := opts.MemoryStorage.FirstIndex() // get the first index in memory
+							fmt.Printf("debug_added_by_Param: FirstIndex: %v\n", i)
 							Expect(err).NotTo(HaveOccurred())
 
 							// expect storage to preserve SnapshotCatchUpEntries entries before snapshot
@@ -1017,6 +1146,7 @@ var _ = Describe("Chain", func() {
 							chain.Halt()
 
 							raftMetadata.RaftIndex = m.RaftIndex
+							fmt.Printf("debug_added_by_Param: RaftIndex:%v\n", m.RaftIndex)
 							c := newChain(10*time.Second, channelID, dataDir, 1, raftMetadata, consenters, cryptoProvider, nil, nil)
 							c.opts.SnapshotIntervalSize = 1
 
@@ -1126,8 +1256,9 @@ var _ = Describe("Chain", func() {
 							Eventually(c.opts.MemoryStorage.LastIndex, LongEventualTimeout).Should(Equal(lasti))
 						})
 
+						//debug_added_by_param
 						When("local ledger is in sync with snapshot", func() {
-							It("does not pull blocks and still respects snapshot interval", func() {
+							FIt("does not pull blocks and still respects snapshot interval", func() {
 								// Scenario:
 								// - snapshot is taken at block 2
 								// - order one more envelope (block 3)
@@ -1166,6 +1297,27 @@ var _ = Describe("Chain", func() {
 								Eventually(support.WriteBlockCallCount, LongEventualTimeout).Should(Equal(3))
 
 								chain.Halt()
+
+								/* 								fmt.Println("getting into sleep")
+
+								   								time.Sleep(1 * time.Minute)
+
+								   								fmt.Println("woken up") */
+
+								wd, err := os.Open(snapDir)
+								Expect(err).NotTo(HaveOccurred())
+								defer wd.Close()
+								names, err := wd.Readdirnames(-1)
+								Expect(err).NotTo(HaveOccurred())
+								sort.Sort(sort.Reverse(sort.StringSlice(names)))
+
+								for _, f := range names {
+									if strings.HasSuffix(f, ".snap") {
+										err = os.Remove(filepath.Join(snapDir, names[0]))
+										Expect(err).NotTo(HaveOccurred())
+										break
+									}
+								}
 
 								raftMetadata.RaftIndex = m.RaftIndex
 								c := newChain(10*time.Second, channelID, dataDir, 1, raftMetadata, consenters, cryptoProvider, nil, nil)
@@ -3119,7 +3271,7 @@ var _ = Describe("Chain", func() {
 					Eventually(c1.opts.MemoryStorage.FirstIndex, LongEventualTimeout).Should(BeNumerically(">", i))
 				})
 
-				It("lagged node can catch up using snapshot", func() {
+				FIt("lagged node can catch up using snapshot", func() {
 					network.disconnect(2)
 					c1.cutter.CutNext = true
 
