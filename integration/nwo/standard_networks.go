@@ -292,17 +292,18 @@ func MultiNodeEtcdRaft() *Config {
 
 func MultiNodeBFT() *Config {
 	config := BasicConfig()
-
+	config.SystemChannel = nil
 	config.Consensus.Type = "BFT"
 	config.Orderers = []*Orderer{
 		{Name: "orderer1", Organization: "OrdererOrg"},
 		{Name: "orderer2", Organization: "OrdererOrg"},
 		{Name: "orderer3", Organization: "OrdererOrg"},
+		{Name: "orderer4", Organization: "OrdererOrg"},
 	}
 	config.Profiles = []*Profile{
 		{
 			Name:     "SampleDevModeBFT",
-			Orderers: []string{"orderer1", "orderer2", "orderer3"},
+			Orderers: []string{"orderer1", "orderer2", "orderer3", "orderer4"},
 		},
 		{
 			Name:          "TwoOrgsChannel",
@@ -317,7 +318,7 @@ func MultiNodeBFT() *Config {
 
 func BasicSmartBFT() *Config {
 	config := BasicConfig()
-	config.Consensus.Type = "smartbft"
+	config.Consensus.Type = "BFT"
 	config.Profiles = []*Profile{{
 		Name:     "SampleDevModeSmartBFT",
 		Orderers: []string{"orderer"},
@@ -326,33 +327,28 @@ func BasicSmartBFT() *Config {
 		Consortium:    "SampleConsortium",
 		Organizations: []string{"Org1", "Org2"},
 	}}
-	/* 	for _, peer := range config.Peers {
-		peer.BFTDeliveryClient = true
-	} */
-	config.SystemChannel.Profile = "SampleDevModeSmartBFT"
 	return config
 }
 
 func MultiNodeSmartBFT() *Config {
 	config := BasicSmartBFT()
 	config.Orderers = []*Orderer{
-		{Name: "orderer1", Organization: "OrdererOrg"},
-		{Name: "orderer2", Organization: "OrdererOrg"},
-		{Name: "orderer3", Organization: "OrdererOrg"},
-		{Name: "orderer4", Organization: "OrdererOrg"},
+		{Name: "orderer1", Organization: "OrdererOrg", Id: 1},
+		{Name: "orderer2", Organization: "OrdererOrg", Id: 2},
+		{Name: "orderer3", Organization: "OrdererOrg", Id: 3},
+		{Name: "orderer4", Organization: "OrdererOrg", Id: 4},
 	}
 	config.Profiles = []*Profile{{
-		Name:     "SampleDevModeSmartBFT",
-		Orderers: []string{"orderer1", "orderer2", "orderer3", "orderer4"},
-	}, {
-		Name:          "TwoOrgsChannel",
-		Consortium:    "SampleConsortium",
-		Organizations: []string{"Org1", "Org2"},
+		ChannelCapabilities: []string{"V3_0"},
+		Name:                "SampleDevModeSmartBFT",
+		Orderers:            []string{"orderer1", "orderer2", "orderer3", "orderer4"},
+		Organizations:       []string{"Org1", "Org2"},
+		AppCapabilities:     []string{"V2_0"},
 	}}
 
 	config.Channels = []*Channel{
-		{Name: "testchannel1", Profile: "TwoOrgsChannel"},
-		{Name: "testchannel2", Profile: "TwoOrgsChannel"},
+		{Name: "testchannel1", Profile: "SampleDevModeSmartBFT"},
+		{Name: "testchannel2", Profile: "SampleDevModeSmartBFT"},
 	}
 
 	for _, peer := range config.Peers {
