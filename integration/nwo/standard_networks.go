@@ -352,7 +352,8 @@ func MultiNodeSmartBFT() *Config {
 
 	config.Channels = []*Channel{
 		{Name: "testchannel1", Profile: "TwoOrgsChannel"},
-		{Name: "testchannel2", Profile: "TwoOrgsChannel"}}
+		{Name: "testchannel2", Profile: "TwoOrgsChannel"},
+	}
 
 	for _, peer := range config.Peers {
 		peer.Channels = []*PeerChannel{
