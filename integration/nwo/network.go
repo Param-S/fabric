@@ -1898,3 +1898,15 @@ func (n *Network) GenerateCoreConfig(p *Peer) {
 	err = t.Execute(io.MultiWriter(core, pw), n)
 	Expect(err).NotTo(HaveOccurred())
 }
+
+// OrdererCert returns the path to the orderer's certificate.
+func (n *Network) OrdererCert(o *Orderer) string {
+	org := n.Organization(o.Organization)
+	Expect(org).NotTo(BeNil())
+
+	return filepath.Join(
+		n.OrdererLocalMSPDir(o),
+		"signcerts",
+		fmt.Sprintf("%s.%s-cert.pem", o.Name, org.Domain),
+	)
+}
