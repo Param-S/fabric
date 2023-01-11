@@ -46,7 +46,7 @@ require (
 )
 
 require (
-	github.com/SmartBFT-Go/consensus v0.0.0-20221012144843-6833de85c58f
+	github.com/SmartBFT-Go/consensus v0.0.0-20221214100733-cb0a41b2b056
 	google.golang.org/protobuf v1.28.1
 )
 

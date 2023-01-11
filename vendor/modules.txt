@@ -56,7 +56,7 @@ github.com/Microsoft/hcsshim/internal/vmcompute
 github.com/Microsoft/hcsshim/internal/wclayer
 github.com/Microsoft/hcsshim/internal/winapi
 github.com/Microsoft/hcsshim/osversion
-# github.com/SmartBFT-Go/consensus v0.0.0-20221012144843-6833de85c58f
+# github.com/SmartBFT-Go/consensus v0.0.0-20221214100733-cb0a41b2b056
 ## explicit; go 1.15
 github.com/SmartBFT-Go/consensus/internal/bft
 github.com/SmartBFT-Go/consensus/pkg/api
