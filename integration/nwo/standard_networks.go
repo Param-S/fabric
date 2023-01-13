@@ -311,7 +311,6 @@ func MultiNodeBFT() *Config {
 			Organizations: []string{"Org1", "Org2"},
 		},
 	}
-	config.SystemChannel.Profile = "SampleDevModeBFT"
 
 	return config
 }
